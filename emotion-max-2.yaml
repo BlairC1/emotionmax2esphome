@@ -1,0 +1,1647 @@
+# LinknLink eMotion Max 2 → ESPHome (LibreTiny, RTL8720CF / LL8720-P module)
+#
+# Radar: Andar ADT6101P, same TinyFrame protocol as the Hi-Link LD6002B, so the
+# native ESPHome ld6002b component owns the UART and the radar's settings.
+# Zones: a lean zone engine – 4 rectangle or polygon zones plus 2 exclusion
+# zones, set from Home Assistant number/text entities. Coordinates are in mm
+# with the sensor at the origin and +Y pointing straight out into the room.
+#
+# Pin map:
+#   PA2/PA3   radar UART (UART1 via build flags below)
+#   PA4       IR LEDs – remote_transmitter (hardware PWM carrier on RTL8720C)
+#   PA18      IR receiver – own edge-timestamping ISR (LibreTiny digitalRead()
+#             tears down the pin interrupt on RTL8720C, breaking remote_receiver)
+#   PA0       dummy remote_receiver – ir_rf_proxy needs one to exist
+#   PA19      radar wake pin (radar header P19)
+#   PA7       pinhole button (low at rest, high when pressed)
+#   PA11/PA14 OPT3004 SCL/SDA, bit-banged I²C, addr 0x44
+#   PA12      status LED red  (common anode → active low, PWM1)
+#   PA17      status LED blue (PWM5) – red/blue bi-colour LED, no green die
+#   PA15/PA16 log UART (UART2)
+#   ?         USB D+/D- – temperature/humidity cable (Broadlink HTS2 / LinknLink
+#             THS, SHT3x/SHT4x expected). Pins not mapped yet: press "Temperature
+#             Sensor Scan" with the cable plugged in and it finds and saves them.
+#
+# The radar board sits upside down in the enclosure (radar X and Z inverted):
+# keep Upside Down Mounting on.
+
+substitutions:
+  device_name: emotion-max-2              # also sets the HA action names (emotion_max_2_send_ir_nec)
+  friendly_name: eMotion Max 2
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: LinknLink eMotion Max 2 (ADT6101P)
+  project:
+    name: BlairC1.emotion-max-2-esphome
+    version: "1.0.0"
+  platformio_options:
+    build_flags:
+      # generic-rtl8720cf only defines alternative UART1 pins (PIN_SERIAL1_RX_0/_1),
+      # which ESPHome can't match – define them so uart: gets hardware UART1
+      - -DPIN_SERIAL1_RX=2u
+      - -DPIN_SERIAL1_TX=3u
+  on_boot:
+    - priority: 600
+      then:
+        # Flash blue until Home Assistant connects; led_status takes over after
+        - lambda: 'id(led_alert) = true;'
+        - light.turn_on:
+            id: status_rgb
+            effect: Boot Flash
+        - wait_until:
+            condition:
+              api.connected:
+                state_subscription_only: true   # HA, not an `esphome logs` session
+            timeout: 60s
+        - script.execute: led_status
+    - priority: -100
+      then:
+        # Safety net – restored numbers/switch normally trigger this already
+        # during setup; mode: restart folds the calls into one write.
+        - script.execute: apply_height_window
+
+rtl87xx:
+  board: generic-rtl8720cf-2mb-992k
+
+logger:
+  level: INFO               # DEBUG logs every state publish – costly on this chip
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    - script.execute: led_status
+  on_client_disconnected:
+    - script.execute: led_status
+  # Send IR from Home Assistant scripts/automations (names follow device_name):
+  #   action: esphome.emotion_max_2_send_ir_raw   data: {command: [9000, -4500, ...]}
+  #   action: esphome.emotion_max_2_send_ir_nec   data: {address: "0xBF00", command: "0xF20D"}
+  actions:
+    - action: send_ir_raw
+      variables:
+        command: int[]
+      then:
+        - remote_transmitter.transmit_raw:
+            transmitter_id: ir_tx
+            carrier_frequency: 38kHz
+            code: !lambda 'return std::vector<int32_t>(command.begin(), command.end());'
+    # Strings so the HA UI accepts hex: "0xBF00" (or decimal "48896")
+    - action: send_ir_nec
+      variables:
+        address: string
+        command: string
+      then:
+        - remote_transmitter.transmit_nec:
+            transmitter_id: ir_tx
+            address: !lambda 'return (uint16_t) strtoul(address.c_str(), nullptr, 0);'
+            command: !lambda 'return (uint16_t) strtoul(command.c_str(), nullptr, 0);'
+
+ota:
+  - platform: esphome
+    # Without a password anyone on your LAN can flash this device. Add
+    # ota_password to secrets.yaml, then uncomment (the next upload still works –
+    # the device only starts asking once this build is on it).
+    # password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light    # radio sleeps between beacons (RTL87xx default is none)
+
+globals:
+  - id: ir_last_tx_ms        # end of our last IR transmission – receiver ignores echoes
+    type: uint32_t
+    initial_value: '0'
+  - id: ir_last_raw          # last code received on PA18 – replayed by "IR Replay Last Code"
+    type: std::vector<int32_t>
+  - id: led_alert            # LED is showing boot flash / HA-lost red (not a colour set from HA)
+    type: bool
+    initial_value: 'false'
+  # Temperature cable bus, found by "Temperature Sensor Scan" and kept across reboots
+  - id: th_sda
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: th_scl
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: th_addr
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: th_scan_req
+    type: bool
+    initial_value: 'false'
+
+uart:
+  id: radar_uart
+  rx_pin: PA2
+  tx_pin: PA3
+  baud_rate: 115200
+  rx_buffer_size: 1024
+
+# ---------------------------------------------------------------------------
+# Radar – native component (framing, command queue with ACK/retry,
+# cluster-tracked target slots, radar-side settings)
+# ---------------------------------------------------------------------------
+ld6002b:
+  id: adt_radar
+  uart_id: radar_uart
+  # Radar wake pin (radar header P19). Before each command the component pulses
+  # it so a radar in low-power sleep wakes and listens. 200 ms rather than the
+  # 50 ms default: with 50 ms the radar woke but occasionally missed the command.
+  wakeup_pin: PA19
+  wakeup_pulse: 200ms
+
+# ---------------------------------------------------------------------------
+# Infrared – native Home Assistant infrared entities via ir_rf_proxy
+# ---------------------------------------------------------------------------
+remote_transmitter:
+  id: ir_tx
+  pin: PA4                  # idle low, active high
+  carrier_duty_percent: 50%
+  non_blocking: true
+  on_complete:
+    - lambda: 'id(ir_last_tx_ms) = millis();'
+
+remote_receiver:
+  id: ir_rx_dummy
+  # Never receives anything – ir_rf_proxy just needs a receiver to exist.
+  # PA0 is the download-mode strap (high = download), so pull it down, never up;
+  # the pull-down also stops a floating pad firing interrupts.
+  pin:
+    number: PA0
+    mode:
+      input: true
+      pulldown: true
+
+infrared:
+  - platform: ir_rf_proxy
+    id: ir_proxy_tx
+    name: IR Transmitter
+    remote_transmitter_id: ir_tx
+  - platform: ir_rf_proxy
+    id: ir_proxy_rx
+    name: IR Receiver
+    remote_receiver_id: ir_rx_dummy
+    receiver_frequency: 38kHz
+
+# ---------------------------------------------------------------------------
+# Status LED – red/blue bi-colour (common anode → inverted). Exposed as an RGB
+# light; green is a no-op output, so only reds, blues and purples show.
+#   boot: flashing blue until Home Assistant connects
+#   HA connected: off (free to use from HA)
+#   HA lost for 10 s (or never connected after boot): solid red
+# ---------------------------------------------------------------------------
+output:
+  - platform: libretiny_pwm
+    id: led_r
+    pin: PA12
+    inverted: true
+  - platform: libretiny_pwm
+    id: led_b
+    pin: PA17
+    inverted: true
+  - platform: template
+    id: led_g
+    type: float
+    write_action:
+      - lambda: '// no green die in this LED'
+
+light:
+  - platform: rgb
+    id: status_rgb
+    name: Status LED
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    entity_category: config
+    effects:
+      - strobe:
+          name: Boot Flash
+          colors:
+            - state: true
+              brightness: 100%
+              red: 0%
+              green: 0%
+              blue: 100%
+              duration: 250ms
+            - state: false
+              duration: 250ms
+
+script:
+  # Translate the floor-relative height window into the radar's own Z range.
+  # The radar filters targets outside it before tracking.
+  - id: apply_height_window
+    mode: restart
+    then:
+      - delay: 1s            # coalesce edits to several numbers
+      # Wait for ld6002b to read the radar's current range. Never write blind.
+      - wait_until:
+          condition:
+            lambda: 'return !std::isnan(id(radar_z_min).state) && !std::isnan(id(radar_z_max).state);'
+          timeout: 30s
+      - lambda: |-
+          if (std::isnan(id(radar_z_min).state) || std::isnan(id(radar_z_max).state)) {
+            ESP_LOGW("height", "Radar hasn't reported its Z range – not writing");
+            return;
+          }
+          float h  = id(sensor_height).state;
+          float lo = id(min_detect_height).state;
+          float hi = id(max_detect_height).state;
+          if (std::isnan(h) || std::isnan(lo) || std::isnan(hi)) return;
+          if (hi < lo + 0.1f) {
+            ESP_LOGW("height", "Maximum height must be above minimum – using %.2f m", lo + 0.1f);
+            hi = lo + 0.1f;
+          }
+          // Window in room terms (+Z up), relative to the sensor...
+          float zlo = lo - h, zhi = hi - h;
+          // ...then into the radar's frame, inverted when the board is upside down
+          float zmin, zmax;
+          if (id(inverse_mounting).state) { zmin = -zhi; zmax = -zlo; }
+          else                            { zmin = zlo;  zmax = zhi;  }
+          float cur_min = id(radar_z_min).state, cur_max = id(radar_z_max).state;
+          if (fabsf(cur_min - zmin) <= 0.005f && fabsf(cur_max - zmax) <= 0.005f) return;
+
+          auto set_min = [&]() { auto c = id(radar_z_min).make_call(); c.set_value(zmin); c.perform(); };
+          auto set_max = [&]() { auto c = id(radar_z_max).make_call(); c.set_value(zmax); c.perform(); };
+          // The radar rejects min above max, so order the writes so the
+          // intermediate range is always valid.
+          if (zmin > cur_max) { set_max(); set_min(); }
+          else { set_min(); set_max(); }
+
+          ESP_LOGI("height", "Detection window %.2f-%.2f m above floor (sensor at %.2f m%s) -> radar Z %.2f..%.2f",
+                   lo, hi, h, id(inverse_mounting).state ? ", upside down" : "", zmin, zmax);
+
+  # Only touches the LED for its own alerts: a colour you set from HA is left
+  # alone when other API clients (dashboard logs etc.) come and go.
+  - id: led_status
+    mode: restart
+    then:
+      - if:
+          condition:
+            not:
+              api.connected:
+                state_subscription_only: true
+          then:
+            - delay: 10s        # ride out brief reconnects without flashing red
+      - if:
+          condition:
+            api.connected:
+              state_subscription_only: true
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(led_alert);'
+                then:
+                  - lambda: 'id(led_alert) = false;'
+                  - light.turn_off: status_rgb
+          else:
+            - lambda: 'id(led_alert) = true;'
+            - light.turn_on:
+                id: status_rgb
+                effect: none
+                brightness: 100%
+                red: 100%
+                green: 0%
+                blue: 0%
+
+# ---------------------------------------------------------------------------
+# Buttons
+# ---------------------------------------------------------------------------
+button:
+  - platform: restart
+    id: do_restart
+    name: Restart
+  - platform: template
+    id: ir_replay
+    name: IR Replay Last Code
+    icon: mdi:remote
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(ir_last_raw).empty();'
+          then:
+            - logger.log:
+                level: WARN
+                tag: ir_tx
+                format: "Nothing learned yet – point a remote at the sensor first"
+          else:
+            - remote_transmitter.transmit_raw:
+                transmitter_id: ir_tx
+                carrier_frequency: 38kHz
+                code: !lambda 'return id(ir_last_raw);'
+  - platform: factory_reset
+    id: do_factory_reset
+    name: Factory Reset
+    entity_category: config
+  # Probes the free GPIOs for the USB-cable sensor. Press with the cable plugged
+  # in; the result shows in "Temperature Sensor Bus" and is saved.
+  - platform: template
+    id: th_scan
+    name: Temperature Sensor Scan
+    icon: mdi:magnify-scan
+    entity_category: config
+    on_press:
+      - lambda: 'id(th_scan_req) = true;'
+
+  # Hisense A40KAU (VIDAA) – NEC address 0xBF00. Discrete on/off verified to wake
+  # the TV from deep standby; codes from hawkins.id.au, converted to ESPHome order.
+  - platform: template
+    id: tv_power_on
+    name: "TV Power On"
+    icon: mdi:power-on
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: ir_tx
+          address: 0xBF00
+          command: 0x2FD0
+  - platform: template
+    id: tv_power_off
+    name: "TV Power Off"
+    icon: mdi:power-off
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: ir_tx
+          address: 0xBF00
+          command: 0x2ED1
+  - platform: template
+    id: tv_home
+    name: "TV Home"
+    icon: mdi:home
+    on_press:
+      - remote_transmitter.transmit_nec:
+          transmitter_id: ir_tx
+          address: 0xBF00
+          command: 0xED12
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    auto_interference:
+      name: Radar Auto Interference
+    clear_interference:
+      name: Radar Clear Interference
+    reset_detection_area:
+      name: Radar Reset Detection Areas
+    reset_unattended:
+      name: Radar Reset Unattended
+    apply_area:
+      name: Radar Apply Area
+      disabled_by_default: true
+
+# ---------------------------------------------------------------------------
+# Binary sensors – occupancy, zones, targets, button
+# ---------------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "Occupancy"
+    device_class: occupancy
+    id: occupancy
+    filters:
+      - delayed_off: !lambda return (id(off_delay).state * 1000);
+
+  - platform: template
+    name: "Zone 1 Occupancy"
+    device_class: occupancy
+    id: zone1_occupancy
+    filters:
+      - delayed_off: !lambda return (id(zone_1_off_delay).state * 1000);
+  - platform: template
+    name: "Zone 2 Occupancy"
+    device_class: occupancy
+    id: zone2_occupancy
+    filters:
+      - delayed_off: !lambda return (id(zone_2_off_delay).state * 1000);
+    disabled_by_default: true
+  - platform: template
+    name: "Zone 3 Occupancy"
+    device_class: occupancy
+    id: zone3_occupancy
+    filters:
+      - delayed_off: !lambda return (id(zone_3_off_delay).state * 1000);
+    disabled_by_default: true
+  - platform: template
+    name: "Zone 4 Occupancy"
+    device_class: occupancy
+    id: zone4_occupancy
+    filters:
+      - delayed_off: !lambda return (id(zone_4_off_delay).state * 1000);
+    disabled_by_default: true
+
+  - platform: template
+    name: "Target 1 Active"
+    id: target1_active
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 2 Active"
+    id: target2_active
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 3 Active"
+    id: target3_active
+    entity_category: diagnostic
+
+  - platform: gpio
+    id: key
+    name: Button
+    pin:
+      number: PA7
+      mode: INPUT          # reads low at rest, high when pressed – not inverted
+    filters:
+      - delayed_on: 20ms
+    on_multi_click:
+      - timing:
+          - ON for at least 10s
+        then:
+          - button.press: do_factory_reset
+      - timing:
+          - ON for 5s to 10s
+          - OFF for at least 0.1s
+        then:
+          - button.press: do_restart
+
+# ---------------------------------------------------------------------------
+# Sensors
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: template
+    name: "Target 1 X"
+    id: target1_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 1 Y"
+    id: target1_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 2 X"
+    id: target2_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 2 Y"
+    id: target2_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 3 X"
+    id: target3_x
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Target 3 Y"
+    id: target3_y
+    accuracy_decimals: 0
+    unit_of_measurement: 'mm'
+    state_class: measurement
+    device_class: distance
+    entity_category: diagnostic
+  - platform: template
+    name: "Zone 1 Target Count"
+    id: zone1_target_count
+    accuracy_decimals: 0
+    unit_of_measurement: " "
+    entity_category: diagnostic
+  - platform: template
+    name: "Zone 2 Target Count"
+    id: zone2_target_count
+    accuracy_decimals: 0
+    disabled_by_default: true
+    unit_of_measurement: " "
+    entity_category: diagnostic
+  - platform: template
+    name: "Zone 3 Target Count"
+    id: zone3_target_count
+    accuracy_decimals: 0
+    disabled_by_default: true
+    unit_of_measurement: " "
+    entity_category: diagnostic
+  - platform: template
+    name: "Zone 4 Target Count"
+    id: zone4_target_count
+    accuracy_decimals: 0
+    disabled_by_default: true
+    unit_of_measurement: " "
+    entity_category: diagnostic
+  - platform: template
+    name: "Occupancy Mask 1 Target Count"
+    id: occupancy_mask_1_target_count
+    accuracy_decimals: 0
+    disabled_by_default: true
+    unit_of_measurement: " "
+    entity_category: diagnostic
+  - platform: template
+    name: "Occupancy Mask 2 Target Count"
+    id: occupancy_mask_2_target_count
+    accuracy_decimals: 0
+    disabled_by_default: true
+    unit_of_measurement: " "
+    entity_category: diagnostic
+
+  # Native radar target feeds – internal, read by the zone lambda.
+  # filters: [] overrides the component's default timeout + 1 s throttle.
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    target_1:
+      x: { id: adt_t1_x, internal: true, filters: [] }
+      y: { id: adt_t1_y, internal: true, filters: [] }
+      z:
+        id: adt_t1_z
+        internal: true
+        filters:
+          - throttle: 1s
+        on_value:
+          - lambda: |-
+              // +up in the room; only publish moves of 5 cm+ (and appear/disappear)
+              float z = id(inverse_mounting).state ? -x : x;
+              float h = std::isnan(x) ? NAN : id(sensor_height).state + z;
+              float cur = id(target1_height).state;
+              if (std::isnan(h) != std::isnan(cur) || fabsf(h - cur) >= 0.05f)
+                id(target1_height).publish_state(h);
+    target_2:
+      x: { id: adt_t2_x, internal: true, filters: [] }
+      y: { id: adt_t2_y, internal: true, filters: [] }
+    target_3:
+      x: { id: adt_t3_x, internal: true, filters: [] }
+      y: { id: adt_t3_y, internal: true, filters: [] }
+  - platform: template
+    id: target1_height
+    name: Target 1 Height
+    entity_category: diagnostic
+    unit_of_measurement: m
+    device_class: distance
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: illuminance
+    name: Illuminance
+    device_class: illuminance
+    state_class: measurement
+    unit_of_measurement: lx
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: room_temperature
+    name: Temperature
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: °C
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: room_humidity
+    name: Humidity
+    device_class: humidity
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+
+text_sensor:
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    ota_version:
+      name: Radar Firmware
+    work_mode:
+      name: Radar Work Mode
+  - platform: template
+    id: th_bus
+    name: Temperature Sensor Bus
+    icon: mdi:usb
+    entity_category: diagnostic
+    update_interval: never
+
+# ---------------------------------------------------------------------------
+# Numbers
+# ---------------------------------------------------------------------------
+number:
+  - platform: template
+    name: "Occupancy Off Delay"
+    id: off_delay
+    max_value: 600
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    initial_value: 15
+    entity_category: config
+  - platform: template
+    name: "Max Distance"
+    id: distance
+    max_value: 600
+    min_value: 0
+    unit_of_measurement: "cm"
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 600
+    entity_category: config
+  - platform: template
+    name: "Installation Angle"
+    id: installation_angle_ui
+    unit_of_measurement: "º"
+    min_value: -45
+    max_value: 45
+    step: 1
+    update_interval: never
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    icon: "mdi:angle-acute"
+    entity_category: config
+
+  - platform: template
+    name: "Zone 1 Occupancy Off Delay"
+    id: zone_1_off_delay
+    max_value: 600
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    initial_value: 15
+    entity_category: config
+
+  - platform: template
+    name: "Zone 2 Occupancy Off Delay"
+    id: zone_2_off_delay
+    max_value: 600
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    initial_value: 15
+    disabled_by_default: true
+    entity_category: config
+
+  - platform: template
+    name: "Zone 3 Occupancy Off Delay"
+    id: zone_3_off_delay
+    max_value: 600
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    initial_value: 15
+    disabled_by_default: true
+    entity_category: config
+
+  - platform: template
+    name: "Zone 4 Occupancy Off Delay"
+    id: zone_4_off_delay
+    max_value: 600
+    min_value: 0
+    step: 1
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "s"
+    initial_value: 15
+    disabled_by_default: true
+    entity_category: config
+
+  # Rectangle zones / exclusion masks (used when Polygon Zones is off)
+  - platform: template
+    name: "Zone 1 Begin X"
+    id: zone1_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: -4000
+    entity_category: config
+  - platform: template
+    name: "Zone 1 End X"
+    id: zone1_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 4000
+    entity_category: config
+  - platform: template
+    name: "Zone 1 Begin Y"
+    id: zone1_begin_y
+    max_value: 6000
+    min_value: -1560   # Installation Angle up to ±45° with a ±60° field of view puts targets down to 6000·sin(-15°) ≈ -1553 mm
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    entity_category: config
+  - platform: template
+    name: "Zone 1 End Y"
+    id: zone1_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 6000
+    entity_category: config
+  - platform: template
+    name: "Zone 2 Begin X"
+    id: zone2_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 2 End X"
+    id: zone2_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 2 Begin Y"
+    id: zone2_begin_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 2 End Y"
+    id: zone2_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 3 Begin X"
+    id: zone3_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 3 End X"
+    id: zone3_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 3 Begin Y"
+    id: zone3_begin_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 3 End Y"
+    id: zone3_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 4 Begin X"
+    id: zone4_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 4 End X"
+    id: zone4_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 4 Begin Y"
+    id: zone4_begin_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Zone 4 End Y"
+    id: zone4_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 1 Begin X"
+    id: occupancy_mask_1_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 1 End X"
+    id: occupancy_mask_1_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 1 Begin Y"
+    id: occupancy_mask_1_begin_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 1 End Y"
+    id: occupancy_mask_1_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 2 Begin X"
+    id: occupancy_mask_2_begin_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 2 End X"
+    id: occupancy_mask_2_end_x
+    max_value: 6000
+    min_value: -6000
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 2 Begin Y"
+    id: occupancy_mask_2_begin_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+  - platform: template
+    name: "Occupancy Mask 2 End Y"
+    id: occupancy_mask_2_end_y
+    max_value: 6000
+    min_value: -1560
+    unit_of_measurement: "mm"
+    step: 10
+    optimistic: true
+    restore_value: true
+    disabled_by_default: true
+    entity_category: config
+
+  # Height window, floor-relative. Height is the centre of a person's
+  # reflections (≈ torso), not the top of their head.
+  - platform: template
+    id: sensor_height
+    name: Sensor Height
+    entity_category: config
+    icon: mdi:arrow-expand-vertical
+    unit_of_measurement: m
+    device_class: distance
+    min_value: 0
+    max_value: 3
+    step: 0.01
+    initial_value: 0.92
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: apply_height_window
+  - platform: template
+    id: min_detect_height
+    name: Minimum Detection Height
+    entity_category: config
+    icon: mdi:format-vertical-align-bottom
+    unit_of_measurement: m
+    device_class: distance
+    min_value: 0
+    max_value: 3
+    step: 0.05
+    initial_value: 0.0       # raise to ignore people lying down (e.g. 0.8 m above a bed)
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: apply_height_window
+  - platform: template
+    id: max_detect_height
+    name: Maximum Detection Height
+    entity_category: config
+    icon: mdi:format-vertical-align-top
+    unit_of_measurement: m
+    device_class: distance
+    min_value: 0.5
+    max_value: 4
+    step: 0.05
+    initial_value: 2.9
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: apply_height_window
+
+  # Calibration for the cable sensor (e.g. against a reference thermometer)
+  - platform: template
+    id: temp_offset
+    name: Temperature Offset
+    entity_category: config
+    icon: mdi:thermometer-plus
+    unit_of_measurement: °C
+    min_value: -10
+    max_value: 10
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  # Radar-side settings (stored in the radar's own flash)
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    hold_delay:
+      name: Radar Hold Delay
+    low_power_sleep_time:
+      name: Radar Low Power Sleep     # ms between measurements in low-power mode
+    # Raw radar-frame Z window – driven by the height numbers above
+    z_min:
+      id: radar_z_min
+      name: Radar Z Min
+      internal: true
+    z_max:
+      id: radar_z_max
+      name: Radar Z Max
+      internal: true
+    area_config:
+      x_min: { name: Radar Area X Min, disabled_by_default: true }
+      x_max: { name: Radar Area X Max, disabled_by_default: true }
+      y_min: { name: Radar Area Y Min, disabled_by_default: true }
+      y_max: { name: Radar Area Y Max, disabled_by_default: true }
+      z_min: { name: Radar Area Z Min, disabled_by_default: true }
+      z_max: { name: Radar Area Z Max, disabled_by_default: true }
+
+select:
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    sensitivity:
+      name: Radar Sensitivity
+    trigger_speed:
+      name: Radar Trigger Speed
+    installation_mode:
+      name: Radar Installation Mode
+    area_id:
+      name: Radar Area
+      disabled_by_default: true
+
+switch:
+  # Radar low-power mode: the radar sleeps between short measurements. Saves
+  # power but slows response and loses still people – for "asleep / away".
+  # ALWAYS_OFF: every boot sends "low power off", so a reboot or power cycle
+  # always brings the radar back to normal mode.
+  - platform: ld6002b
+    ld6002b_id: adt_radar
+    low_power:
+      name: Radar Low Power
+      restore_mode: ALWAYS_OFF
+  - platform: template
+    name: "Upside Down Mounting"
+    id: inverse_mounting
+    # The radar board sits upside down in the LinknLink enclosure: radar X and Z
+    # are both inverted relative to the room. Mirrors X for the zones AND flips
+    # Z for the height window / Target 1 Height.
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    entity_category: config
+    icon: "mdi:rotate-180"
+    on_turn_on:
+      - script.execute: apply_height_window
+    on_turn_off:
+      - script.execute: apply_height_window
+  - platform: template
+    name: "Polygon Zones"
+    id: polygon_zones_enabled
+    restore_mode: RESTORE_DEFAULT_OFF   # off = rectangle zones, on = polygon zones
+    optimistic: true
+    entity_category: config
+    icon: "mdi:vector-polygon"
+
+text:
+  - platform: template
+    name: "Polygon Zone 1"
+    id: poly_zone_1
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+  - platform: template
+    name: "Polygon Zone 2"
+    id: poly_zone_2
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+  - platform: template
+    name: "Polygon Zone 3"
+    id: poly_zone_3
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+  - platform: template
+    name: "Polygon Zone 4"
+    id: poly_zone_4
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+  - platform: template
+    name: "Polygon Exclusion 1"
+    id: poly_exclusion_1
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+  - platform: template
+    name: "Polygon Exclusion 2"
+    id: poly_exclusion_2
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    icon: "mdi:vector-polygon"
+
+interval:
+  # -------------------------------------------------------------------------
+  # Zone engine
+  # -------------------------------------------------------------------------
+  - interval: 50ms
+    then:
+      - lambda: |-
+          // Lean zone engine: radar slots -> room frame -> rectangle or polygon zones.
+          // Runs every 50 ms (about one radar frame); publishes only what changes.
+          static const float DEG2RAD = 3.14159265f / 180.0f;
+          const float max_d = id(distance).state * 10.0f;              // cm -> mm
+          const float inst  = id(installation_angle_ui).state * DEG2RAD;
+          const bool  flip  = id(inverse_mounting).state;
+          const bool  poly_mode = id(polygon_zones_enabled).state;   // off = rectangles
+
+          // ---- Polygons ("x:y;x:y;..." in mm), re-parsed only when the text changes ----
+          struct Poly { float vx[20]; float vy[20]; int n; };
+          static Poly zones[4], excl[2];
+          static std::string zone_txt[4], excl_txt[2];
+          static bool parsed = false;
+
+          auto parse = [](const std::string &s, Poly &p) {
+            p.n = 0;
+            size_t pos = 0;
+            while (pos < s.length() && p.n < 20) {
+              int x, y, used;
+              if (sscanf(s.c_str() + pos, "%d:%d%n", &x, &y, &used) != 2) break;
+              p.vx[p.n] = (float) x;
+              p.vy[p.n] = (float) y;
+              p.n++;
+              pos += used;
+              if (pos < s.length() && s[pos] == ';') pos++;
+            }
+          };
+          auto inside = [](float px, float py, const Poly &p) -> bool {
+            if (p.n < 3) return false;
+            bool hit = false;
+            for (int i = 0, j = p.n - 1; i < p.n; j = i++) {
+              if (((p.vy[i] > py) != (p.vy[j] > py)) &&
+                  (px < (p.vx[j] - p.vx[i]) * (py - p.vy[i]) / (p.vy[j] - p.vy[i]) + p.vx[i]))
+                hit = !hit;
+            }
+            return hit;
+          };
+
+          text::Text *zone_ent[4] = { id(poly_zone_1), id(poly_zone_2), id(poly_zone_3), id(poly_zone_4) };
+          text::Text *excl_ent[2] = { id(poly_exclusion_1), id(poly_exclusion_2) };
+          for (int z = 0; z < 4; z++)
+            if (!parsed || zone_ent[z]->state != zone_txt[z]) { zone_txt[z] = zone_ent[z]->state; parse(zone_txt[z], zones[z]); }
+          for (int e = 0; e < 2; e++)
+            if (!parsed || excl_ent[e]->state != excl_txt[e]) { excl_txt[e] = excl_ent[e]->state; parse(excl_txt[e], excl[e]); }
+          parsed = true;
+
+          // ---- Rectangles (Begin/End in either order) ----
+          struct Rect { float x0, x1, y0, y1; };
+          auto make_rect = [](number::Number *bx, number::Number *ex, number::Number *by, number::Number *ey) -> Rect {
+            return { std::min(bx->state, ex->state), std::max(bx->state, ex->state),
+                     std::min(by->state, ey->state), std::max(by->state, ey->state) };
+          };
+          auto in_rect = [](float x, float y, const Rect &r) -> bool {
+            return r.x0 <= x && x <= r.x1 && r.y0 <= y && y <= r.y1;   // false if any bound is NaN
+          };
+          Rect rzone[4] = {
+            make_rect(id(zone1_begin_x), id(zone1_end_x), id(zone1_begin_y), id(zone1_end_y)),
+            make_rect(id(zone2_begin_x), id(zone2_end_x), id(zone2_begin_y), id(zone2_end_y)),
+            make_rect(id(zone3_begin_x), id(zone3_end_x), id(zone3_begin_y), id(zone3_end_y)),
+            make_rect(id(zone4_begin_x), id(zone4_end_x), id(zone4_begin_y), id(zone4_end_y)),
+          };
+          Rect rmask[2] = {
+            make_rect(id(occupancy_mask_1_begin_x), id(occupancy_mask_1_end_x), id(occupancy_mask_1_begin_y), id(occupancy_mask_1_end_y)),
+            make_rect(id(occupancy_mask_2_begin_x), id(occupancy_mask_2_end_x), id(occupancy_mask_2_begin_y), id(occupancy_mask_2_end_y)),
+          };
+          auto in_zone = [&](float x, float y, int z) -> bool { return poly_mode ? inside(x, y, zones[z]) : in_rect(x, y, rzone[z]); };
+          auto in_mask = [&](float x, float y, int e) -> bool { return poly_mode ? inside(x, y, excl[e]) : in_rect(x, y, rmask[e]); };
+
+          // ---- Targets (radar metres -> mm, room frame) ----
+          float in_x[3] = { id(adt_t1_x).state, id(adt_t2_x).state, id(adt_t3_x).state };
+          float in_y[3] = { id(adt_t1_y).state, id(adt_t2_y).state, id(adt_t3_y).state };
+          sensor::Sensor *sx[3] = { id(target1_x), id(target2_x), id(target3_x) };
+          sensor::Sensor *sy[3] = { id(target1_y), id(target2_y), id(target3_y) };
+          binary_sensor::BinarySensor *sact[3] = { id(target1_active), id(target2_active), id(target3_active) };
+
+          int zc[4] = { 0, 0, 0, 0 }, mc[2] = { 0, 0 }, active = 0;
+          bool det[3] = { false, false, false };
+          float px[3] = { 0, 0, 0 }, py[3] = { 0, 0, 0 };
+
+          for (int t = 0; t < 3; t++) {
+            if (std::isnan(in_x[t]) || std::isnan(in_y[t])) continue;
+            float x = in_x[t] * 1000.0f, y = in_y[t] * 1000.0f;
+            float d = sqrtf(x * x + y * y);
+            if (d > max_d) continue;
+            if (flip) x = -x;
+            if (inst != 0) {
+              float a = atan2f(y, x) - inst;
+              x = d * cosf(a);
+              y = d * sinf(a);
+            }
+            if (in_mask(x, y, 0)) { mc[0]++; continue; }
+            if (in_mask(x, y, 1)) { mc[1]++; continue; }
+            det[t] = true;
+            px[t] = x;
+            py[t] = y;
+            active++;
+            for (int z = 0; z < 4; z++)
+              if (in_zone(x, y, z)) zc[z]++;
+          }
+
+          // ---- Presence: immediate (binary sensors only send on change) ----
+          id(occupancy).publish_state(active > 0);
+          binary_sensor::BinarySensor *zbin[4] = { id(zone1_occupancy), id(zone2_occupancy), id(zone3_occupancy), id(zone4_occupancy) };
+          for (int z = 0; z < 4; z++) zbin[z]->publish_state(zc[z] > 0);
+          for (int t = 0; t < 3; t++) sact[t]->publish_state(det[t]);
+
+          // ---- Counts: on change ----
+          sensor::Sensor *zcnt[4] = { id(zone1_target_count), id(zone2_target_count), id(zone3_target_count), id(zone4_target_count) };
+          sensor::Sensor *mcnt[2] = { id(occupancy_mask_1_target_count), id(occupancy_mask_2_target_count) };
+          for (int z = 0; z < 4; z++) if (zcnt[z]->state != zc[z]) zcnt[z]->publish_state(zc[z]);
+          for (int e = 0; e < 2; e++) if (mcnt[e]->state != mc[e]) mcnt[e]->publish_state(mc[e]);
+
+          // ---- Positions (live target view in HA): at most every 250 ms ----
+          static uint32_t last_pos = 0;
+          if (millis() - last_pos >= 250) {
+            last_pos = millis();
+            for (int t = 0; t < 3; t++) {
+              float vx = det[t] ? roundf(px[t]) : 0, vy = det[t] ? roundf(py[t]) : 0;
+              if (sx[t]->state != vx) sx[t]->publish_state(vx);
+              if (sy[t]->state != vy) sy[t]->publish_state(vy);
+            }
+          }
+
+  # -------------------------------------------------------------------------
+  # IR receiver on PA18 → Home Assistant infrared receiver entity.
+  # Own interrupt handler that only timestamps edges and never reads the pin
+  # (LibreTiny's digitalRead() is what breaks remote_receiver here). On RTL8720C,
+  # CHANGE really is both edges, and the receiver idles high, so the first edge
+  # of a frame is a falling one (mark start) and the levels simply alternate.
+  # -------------------------------------------------------------------------
+  - interval: 20ms
+    then:
+      - lambda: |-
+          static const int rx_pin = 18;            // PA18
+          static const uint16_t max_edges = 600;   // long AC frames are ~260-600 edges
+          static volatile uint32_t edges[max_edges];
+          static volatile uint16_t n_edges = 0;
+          static volatile uint32_t last_edge = 0;
+          static uint32_t e[max_edges];
+          static bool attached = false;
+
+          if (!attached) {
+            attachInterrupt(rx_pin, []() {
+              uint32_t now = micros();             // ISR-safe on this core
+              if (now - last_edge > 15000UL) n_edges = 0;   // >15 ms gap = new frame
+              if (n_edges < max_edges) edges[n_edges++] = now;
+              last_edge = now;
+            }, CHANGE);
+            attached = true;
+            return;
+          }
+
+          // Wait until a burst of edges has been followed by 20 ms of silence
+          if (n_edges == 0 || (micros() - last_edge) < 20000UL) return;
+          __asm volatile("cpsid i" ::: "memory");
+          uint16_t n = n_edges;
+          for (uint16_t i = 0; i < n; i++) e[i] = edges[i];
+          n_edges = 0;
+          __asm volatile("cpsie i" ::: "memory");
+
+          if (millis() - id(ir_last_tx_ms) < 300) return;   // our own transmission bouncing back
+          if (n < 8) return;                                 // noise
+
+          // Edge 0 = mark start; even intervals are marks (+), odd are spaces (-)
+          std::vector<int32_t> raw;
+          raw.reserve(n);
+          for (uint16_t i = 0; i + 1 < n; i++) {
+            int32_t d = (int32_t) (e[i + 1] - e[i]);
+            raw.push_back((i % 2 == 0) ? d : -d);
+          }
+          id(ir_proxy_rx)->on_receive(remote_base::RemoteReceiveData(raw, 25, remote_base::TOLERANCE_MODE_PERCENTAGE));
+
+          ESP_LOGI("ir_rx", "Received %u timings (header %d/%d us)%s", (unsigned) raw.size(),
+                   (int) raw[0], (int) raw[1], (n % 2) ? " – odd edge count, possible glitch" : "");
+
+          // Try NEC (most TVs, fans, LED controllers) – gives a short address/command
+          remote_base::RemoteReceiveData rd(raw, 25, remote_base::TOLERANCE_MODE_PERCENTAGE);
+          auto nec = remote_base::NECProtocol().decode(rd);
+          if (nec.has_value()) {
+            ESP_LOGI("ir_rx", "NEC address=0x%04X command=0x%04X", nec->address, nec->command);
+          } else {
+            // Not NEC: dump raw timings, ready to paste into send_ir_raw
+            // (chunked: logger line limit). NEC codes skip this – send_ir_nec is
+            // simpler, and "IR Replay Last Code" still has the raw version.
+            char line[400];
+            size_t i = 0;
+            int part = 1;
+            while (i < raw.size()) {
+              size_t pos = 0;
+              for (int k = 0; k < 40 && i < raw.size(); k++, i++)
+                pos += snprintf(line + pos, sizeof(line) - pos, "%s%d", k ? ", " : "", (int) raw[i]);
+              ESP_LOGI("ir_rx", "raw[%d]: %s%s", part++, line, i < raw.size() ? "," : "");
+            }
+          }
+          id(ir_last_raw) = std::move(raw);   // for "IR Replay Last Code"
+
+  # -------------------------------------------------------------------------
+  # OPT3004 ambient light sensor – bit-banged I2C (same approach as the RM4s).
+  # SCL=PA11, SDA=PA14, address 0x44. Open-drain style: lines are only ever
+  # pulled low or released (external pull-ups on the board).
+  # Has to be bit-banged: PA14 has no I2C function on the RTL8720CF (I2C0 SDA
+  # is only on PA3/PA12/PA16/PA20), and ESPHome's i2c: on LibreTiny is hardware
+  # only. A read is well under a millisecond of work every 5 s. digitalRead() is
+  # safe here – it only breaks pins that have an interrupt attached.
+  # -------------------------------------------------------------------------
+  - interval: 5s
+    then:
+      - lambda: |-
+          static const int scl = 11;        // PA11
+          static const int sda = 14;        // PA14
+          static const uint8_t addr = 0x44;
+          static bool configured = false;
+
+          auto pin_lo  = [](int p) { pinMode(p, OUTPUT); digitalWrite(p, LOW); };
+          auto pin_rel = [](int p) { pinMode(p, INPUT); };
+          auto pin_rd  = [](int p) { return digitalRead(p) == HIGH; };
+          auto dly     = []() { delayMicroseconds(5); };
+
+          auto i2c_start = [&]() { pin_rel(sda); pin_rel(scl); dly(); pin_lo(sda); dly(); pin_lo(scl); dly(); };
+          auto i2c_stop  = [&]() { pin_lo(sda); dly(); pin_rel(scl); dly(); pin_rel(sda); dly(); };
+          auto i2c_wr = [&](uint8_t b) -> bool {
+            for (int i = 7; i >= 0; i--) {
+              if (b & (1 << i)) pin_rel(sda); else pin_lo(sda);
+              dly(); pin_rel(scl); dly(); pin_lo(scl); dly();
+            }
+            pin_rel(sda); dly(); pin_rel(scl); dly();
+            bool ack = !pin_rd(sda);
+            pin_lo(scl); dly();
+            return ack;
+          };
+          auto i2c_rd = [&](bool ack) -> uint8_t {
+            uint8_t b = 0;
+            pin_rel(sda);
+            for (int i = 7; i >= 0; i--) {
+              dly(); pin_rel(scl); dly();
+              if (pin_rd(sda)) b |= (1 << i);
+              pin_lo(scl);
+            }
+            if (ack) pin_lo(sda); else pin_rel(sda);
+            dly(); pin_rel(scl); dly(); pin_lo(scl); pin_rel(sda);
+            return b;
+          };
+          auto reg_read = [&](uint8_t reg, uint16_t &val) -> bool {
+            i2c_start();
+            if (!i2c_wr(addr << 1) || !i2c_wr(reg)) { i2c_stop(); return false; }
+            i2c_start();
+            if (!i2c_wr((addr << 1) | 1)) { i2c_stop(); return false; }
+            uint8_t msb = i2c_rd(true), lsb = i2c_rd(false);
+            i2c_stop();
+            val = (msb << 8) | lsb;
+            return true;
+          };
+          auto reg_write = [&](uint8_t reg, uint16_t val) -> bool {
+            i2c_start();
+            bool ok = i2c_wr(addr << 1) && i2c_wr(reg) && i2c_wr(val >> 8) && i2c_wr(val & 0xFF);
+            i2c_stop();
+            return ok;
+          };
+
+          if (!configured) {
+            // Auto-range, 800 ms conversions, continuous mode
+            configured = reg_write(0x01, 0xCC10);
+            return;
+          }
+
+          uint16_t res = 0;
+          if (!reg_read(0x00, res)) {
+            ESP_LOGW("lux", "OPT3004 read failed");
+            configured = false;   // reconfigure on the next pass
+            return;
+          }
+          float lux = 0.01f * (float) (1u << (res >> 12)) * (float) (res & 0x0FFF);
+
+          // Read every 5 s, but only publish a real change (>10 % and >0.5 lx,
+          // so dark-room noise stays quiet) or every 5 min as a heartbeat.
+          static uint32_t last_pub = 0;
+          float last = id(illuminance).state;
+          if (std::isnan(last) || millis() - last_pub >= 300000UL ||
+              fabsf(lux - last) > std::max(0.5f, 0.1f * last)) {
+            id(illuminance).publish_state(lux);
+            last_pub = millis();
+          }
+  # -------------------------------------------------------------------------
+  # Temperature/humidity cable on the USB data lines (Broadlink HTS2 /
+  # LinknLink THS – an SHT3x-class sensor talking I2C over D+/D-, powered from
+  # the charger's 5 V). Bit-banged like the OPT3004.
+  #
+  # Which GPIOs D+/D- reach isn't mapped, so "Temperature Sensor Scan" works
+  # it out: it checks the unused pins below, skips any that something holds
+  # low, then tries each pair as SDA/SCL looking for a sensor. Found pins are
+  # saved (globals th_sda/th_scl/th_addr) and used from then on. The scan only
+  # runs when you press the button, because it briefly pulls unknown pins low –
+  # if one of them turned out to be wired to the radar, the radar could need a
+  # power cycle afterwards.
+  #
+  # Reads every 15 s without blocking: each pass collects the previous
+  # measurement and starts the next one.
+  # -------------------------------------------------------------------------
+  - interval: 1s
+    then:
+      - lambda: |-
+          static const int cand[] = { 0, 8, 9, 10, 13, 20, 23 };   // GPIOs not used elsewhere
+          static uint32_t tick = 0;
+          static bool first = true, pending = false;
+          static int type = 0;                // 0 = not identified, 3 = SHT3x, 4 = SHT4x
+          static uint8_t fails = 0;
+          static uint32_t last_t_pub = 0, last_h_pub = 0;
+          int sda = id(th_sda), scl = id(th_scl);
+
+          auto lo  = [](int p) { pinMode(p, OUTPUT); digitalWrite(p, LOW); };
+          auto rel = [](int p) { pinMode(p, INPUT_PULLUP); };   // internal pull-up helps on a 2 m cable
+          auto rd  = [](int p) { return digitalRead(p) == HIGH; };
+          auto dly = []() { delayMicroseconds(20); };            // ~20 kHz – gentle on a long cable
+          auto scl_hi = [&]() {                                    // release SCL, allow clock stretching
+            rel(scl);
+            for (int i = 0; i < 50 && !rd(scl); i++) delayMicroseconds(20);
+          };
+          auto start = [&]() { rel(sda); scl_hi(); dly(); lo(sda); dly(); lo(scl); dly(); };
+          auto stop  = [&]() { lo(sda); dly(); scl_hi(); dly(); rel(sda); dly(); };
+          auto wr = [&](uint8_t b) -> bool {
+            for (int i = 7; i >= 0; i--) {
+              if (b & (1 << i)) rel(sda); else lo(sda);
+              dly(); scl_hi(); dly(); lo(scl);
+            }
+            rel(sda); dly(); scl_hi(); dly();
+            bool ack = !rd(sda);
+            lo(scl); dly();
+            return ack;
+          };
+          auto rdb = [&](bool ack) -> uint8_t {
+            uint8_t b = 0;
+            rel(sda);
+            for (int i = 7; i >= 0; i--) {
+              dly(); scl_hi(); dly();
+              if (rd(sda)) b |= (1 << i);
+              lo(scl);
+            }
+            if (ack) lo(sda); else rel(sda);
+            dly(); scl_hi(); dly(); lo(scl); rel(sda);
+            return b;
+          };
+          auto probe = [&](uint8_t a) -> bool { start(); bool ok = wr(a << 1); stop(); return ok; };
+          auto crc8 = [](uint8_t a, uint8_t b) -> uint8_t {   // Sensirion CRC-8, poly 0x31
+            uint8_t c = 0xFF, d[2] = { a, b };
+            for (int i = 0; i < 2; i++) {
+              c ^= d[i];
+              for (int k = 0; k < 8; k++) c = (c & 0x80) ? (uint8_t) ((c << 1) ^ 0x31) : (uint8_t) (c << 1);
+            }
+            return c;
+          };
+          auto show = [](int s, int c, int a) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "SDA PA%d, SCL PA%d, address 0x%02X", s, c, a);
+            id(th_bus).publish_state(buf);
+          };
+
+          if (first) {
+            first = false;
+            if (sda >= 0 && scl >= 0) show(sda, scl, id(th_addr));
+            else id(th_bus).publish_state("Not found yet – plug in the cable and press Temperature Sensor Scan");
+          }
+
+          // ---- Scan (button) ----
+          if (id(th_scan_req)) {
+            id(th_scan_req) = false;
+            ESP_LOGI("th", "Scanning free GPIOs for the temperature cable...");
+            std::vector<int> up;
+            for (int p : cand) {
+              pinMode(p, INPUT);        delayMicroseconds(200); bool f = rd(p);
+              pinMode(p, INPUT_PULLUP); delayMicroseconds(500); bool u = rd(p);
+              pinMode(p, INPUT);
+              ESP_LOGI("th", "  PA%d: %s on its own, %s with pull-up%s", p, f ? "high" : "low",
+                       u ? "high" : "low", u ? "" : " – held low by something, skipped");
+              if (u) up.push_back(p);
+            }
+            static const uint8_t addrs[] = { 0x44, 0x45, 0x38, 0x40, 0x70 };
+            int fs = -1, fc = -1, fa = -1;
+            for (int a : up) {
+              for (int b : up) {
+                if (a == b || fs >= 0) continue;
+                sda = a; scl = b;
+                rel(sda); rel(scl); dly();
+                if (probe(0x13)) continue;      // ACKs an address nothing uses = not a real bus
+                for (uint8_t ad : addrs)
+                  if (probe(ad)) { fs = a; fc = b; fa = ad; break; }
+              }
+            }
+            for (int p : up) pinMode(p, p == 0 ? INPUT_PULLDOWN : INPUT);   // PA0: back to its pull-down
+
+            if (fa == 0x44 || fa == 0x45) {
+              ESP_LOGI("th", "Found a sensor at 0x%02X: SDA=PA%d SCL=PA%d – saved", fa, fs, fc);
+              id(th_sda) = fs; id(th_scl) = fc; id(th_addr) = fa;
+              type = 0; pending = false; fails = 0; tick = 14;   // start measuring on the next pass
+              show(fs, fc, fa);
+            } else if (fa > 0) {
+              ESP_LOGW("th", "Found an unexpected chip at 0x%02X (SDA=PA%d SCL=PA%d) – not an SHT; send this log", fa, fs, fc);
+              char buf[64];
+              snprintf(buf, sizeof(buf), "Unknown chip 0x%02X on SDA PA%d, SCL PA%d", fa, fs, fc);
+              id(th_bus).publish_state(buf);
+            } else {
+              ESP_LOGW("th", "No sensor found on PA0/8/9/10/13/20/23 – send this log");
+              id(th_bus).publish_state("Scan found nothing – see log");
+            }
+            return;
+          }
+
+          // ---- Measure every 15 s ----
+          if (sda < 0 || scl < 0) return;
+          if (++tick % 15 != 0) return;
+          const uint8_t ad = (uint8_t) id(th_addr);
+
+          auto fail = [&](const char *why) {
+            if (++fails == 3) {
+              ESP_LOGW("th", "Temperature sensor not responding (%s) – unplugged?", why);
+              id(room_temperature).publish_state(NAN);
+              id(room_humidity).publish_state(NAN);
+              type = 0;                         // identify it again when it comes back
+            }
+          };
+
+          if (pending) {
+            pending = false;
+            uint8_t d[6] = { 0 };
+            start();
+            bool ok = wr((ad << 1) | 1);
+            if (ok) for (int i = 0; i < 6; i++) d[i] = rdb(i < 5);
+            stop();
+            if (!ok) {
+              fail("no reply");
+            } else if (crc8(d[0], d[1]) != d[2] || crc8(d[3], d[4]) != d[5]) {
+              fail("bad checksum");
+            } else {
+              if (fails >= 3) ESP_LOGI("th", "Temperature sensor back");
+              fails = 0;
+              uint16_t rt = (d[0] << 8) | d[1], rh = (d[3] << 8) | d[4];
+              float t = -45.0f + 175.0f * rt / 65535.0f + id(temp_offset).state;
+              float h = (type == 4) ? -6.0f + 125.0f * rh / 65535.0f : 100.0f * rh / 65535.0f;
+              h = std::min(100.0f, std::max(0.0f, h));
+              // Publish real changes (0.1 °C / 1 %RH) or every 5 min as a heartbeat
+              float lt = id(room_temperature).state, lh = id(room_humidity).state;
+              if (std::isnan(lt) || fabsf(t - lt) >= 0.1f || millis() - last_t_pub >= 300000UL) {
+                id(room_temperature).publish_state(t);
+                last_t_pub = millis();
+              }
+              if (std::isnan(lh) || fabsf(h - lh) >= 1.0f || millis() - last_h_pub >= 300000UL) {
+                id(room_humidity).publish_state(h);
+                last_h_pub = millis();
+              }
+            }
+          }
+
+          // Start the next measurement (identifying the chip first if needed)
+          bool started = false;
+          if (type == 0 || type == 3) {
+            start(); started = wr(ad << 1) && wr(0x24) && wr(0x00); stop();   // SHT3x single shot, high rep.
+            if (started && type == 0) { type = 3; ESP_LOGI("th", "SHT3x-type sensor at 0x%02X", ad); }
+          }
+          if (!started && (type == 0 || type == 4)) {
+            start(); started = wr(ad << 1) && wr(0xFD); stop();               // SHT4x high precision
+            if (started && type == 0) { type = 4; ESP_LOGI("th", "SHT4x-type sensor at 0x%02X", ad); }
+          }
+          if (started) pending = true;
+          else fail("no ACK");
