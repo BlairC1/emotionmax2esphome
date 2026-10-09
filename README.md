@@ -45,8 +45,8 @@ The radar board is mounted **upside down** in the enclosure, so the radar's X an
 | PA11 / PA14 | OPT3004 SCL / SDA | Bit-banged; PA14 has no hardware I²C function |
 | PA12 | LED red | PWM, active low |
 | PA17 | LED blue | PWM, active low |
-| PA15 / PA16 | Log UART2 RX / TX | Also used for flashing |
-| PA0 | Download-mode strap | High at power-on = download mode. Used here as a placeholder IR receiver pin (input only) |
+| PA15 / PA16 | Log UART2 RX / TX | Used for flashing. Serial logging is off in the config (see Known issues) |
+| PA0 | Download-mode strap | High at power-on = download mode. Placeholder IR receiver pin; its interrupt is detached at boot (see Known issues) |
 | USB D+ / D− | Temperature cable I²C | Not mapped yet. The config's scan button finds them |
 
 Free GPIOs: PA8, PA9, PA10, PA13, PA20, PA23 (not all are necessarily broken out).
@@ -172,13 +172,30 @@ LinknLink's THS cable (and Broadlink's HTS2, from the same family) puts an SHT3x
 
 The scan briefly drives unknown pins, so it only runs when you press the button. If the radar stops responding afterwards, power-cycle the device.
 
+### Diagnostics
+
+- **Radar Data Rate** (B/s): bytes per second arriving from the radar. 0 means the radar has gone silent.
+- **Radar Parser Resyncs**: how many times since boot the parser watchdog has unstuck the radar parser (see Known issues).
+- **Uptime** and **Wi-Fi Signal**: Uptime dropping back to ~0 means the device rebooted.
+
+The log also warns when the radar stops sending data and says how long the silence lasted.
+
 ---
 
 ## Known issues and workarounds
 
-- **Radar sometimes stops responding after an OTA update.** The log shows every `ld6002b` command timing out. An OTA only restarts the Wi-Fi chip; the radar stays powered and can latch up from noise on its RX line during the reboot. Unplug the device for 10 s to fix it.
+- **Lost radar bytes can stall the `ld6002b` parser for minutes.** The parser recovers by itself eventually, so it looks like the radar going quiet and then coming back.
+  - **Why it happens:** after a lost byte, the parser can lock onto a fake frame start whose 1-byte header checksum happens to match (1 in 256). The bogus length is usually over its 1 KB limit, so it logs `Frame too large` and silently skips that many bytes, up to 64 KB. That skip swallows every target report and command reply.
+  - **The fix:** a 10-second watchdog in the config detects a large bogus skip, resets the parser and counts it in **Radar Parser Resyncs**. It reaches the component's protected state through a small `Peek` helper struct.
+  - This is an ESPHome issue rather than a radar fault, and is worth fixing upstream with a byte-gap timeout or resync.
+- **LibreTiny: the serial receive buffer is fixed at 256 bytes, and `uart: rx_buffer_size` is ignored.** 256 bytes is only about 22 ms of radar data at 115200 baud, so any longer stall in the main loop drops bytes, which then triggers the parser stall above. The config raises it to 2048 bytes (about 180 ms) with `rtl87xx: framework: options: LT_SERIAL_BUFFER_SIZE: 2048`.
+- **LibreTiny: serial logging blocks the main loop.** Each log line is written to UART2 while the loop waits, about 1 ms per 11 characters at 115200, and that starves the radar UART. The config sets `logger: baud_rate: 0`. Logs over the API (the ESPHome dashboard, `esphome logs`) still work; set it back to 115200 for bench debugging.
+- **The radar sometimes stops responding after an OTA update.** The log shows every `ld6002b` command timing out. An OTA only restarts the Wi-Fi chip; the radar stays powered, and stray data on its RX line during the reboot can wedge it. ESPHome's `ld6002b` docs note the module has no reset pin or reset command. Some of these cases may actually be the parser stall above, so try the **Restart** button first. If that doesn't clear it, unplug the device for 10 s.
 - **LibreTiny: `generic-rtl8720cf` doesn't define the UART1 pins** (only `PIN_SERIAL1_RX_0/_1`), so ESPHome silently falls back to software serial. The config's `-DPIN_SERIAL1_RX=2u` / `-DPIN_SERIAL1_TX=3u` build flags fix this.
-- **LibreTiny: calling `digitalRead()` inside an interrupt handler tears down the pin interrupt on RTL8720C**, which breaks ESPHome's `remote_receiver`. The config receives IR with its own ISR that only timestamps edges (CHANGE fires on both edges on this chip). The decoded data goes to the `ir_rf_proxy` receiver. A placeholder `remote_receiver` on PA0 exists only because `ir_rf_proxy` requires one.
+- **LibreTiny: calling `digitalRead()` inside an interrupt handler tears down the pin interrupt on RTL8720C**, which breaks ESPHome's `remote_receiver`. The config receives IR with its own ISR that only timestamps edges (CHANGE fires on both edges on this chip). The decoded data goes to the `ir_rf_proxy` receiver.
+- **LibreTiny: freed pin objects are reused** ([#404](https://github.com/libretiny-eu/libretiny/issues/404)). On RTL8720C, attaching an interrupt frees the pin's GPIO object but leaves a dangling pointer. Any later `pinMode()` or `digitalRead()` on that pin then corrupts the heap. That makes the placeholder `remote_receiver` on PA0 (which exists only because `ir_rf_proxy` requires one) a hazard: its interrupt handler calls `digitalRead()`, and the pin floats because attaching the interrupt drops the pull-down. The config detaches its interrupt at boot, and the temperature scan never touches PA0. Never switch a `libretiny_pwm` pin to another mode either.
+- **LibreTiny: RTL8720C support is still young.** LibreTiny's own support table rates it 2/5 for stability, with Wi-Fi, PWM, interrupts and the watchdog marked untested. Also open: [#396](https://github.com/libretiny-eu/libretiny/issues/396), where a restart or OTA can hang the chip itself until it's power-cycled.
+- **Power supply:** the radar peaks at about 600 mA through the board's linear regulator. Use a decent 5 V 2 A supply and cable; brownouts can upset the radar.
 - **No hardware I²C** for the light sensor or temperature cable: their pins don't have I²C functions, and ESPHome's `i2c:` on LibreTiny is hardware-only. Both are bit-banged in lambdas, which costs well under 1 ms per read.
 - **Bluetooth**: the RTL8720CF has BLE 4.2, but LibreTiny has no Bluetooth support for it, so it's unused.
 - **Wi-Fi power save** defaults to `none` on RTL87xx. The config sets `power_save_mode: light`.
@@ -187,7 +204,7 @@ The scan briefly drives unknown pins, so it only runs when you press the button.
 
 ## Credits
 
-- [ESPHome](https://esphome.io) and its `ld6002b` component
+- [ESPHome](https://esphome.io) and its [`ld6002b`](https://esphome.io/components/sensor/ld6002b/) component
 - [LibreTiny](https://github.com/libretiny-eu/libretiny) and ltchiptool
 - [Flipper-IRDB](https://github.com/Lucaslhm/Flipper-IRDB) for IR codes
 
