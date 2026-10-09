@@ -11,7 +11,7 @@
 #   PA4       IR LEDs – remote_transmitter (hardware PWM carrier on RTL8720C)
 #   PA18      IR receiver – own edge-timestamping ISR (LibreTiny digitalRead()
 #             tears down the pin interrupt on RTL8720C, breaking remote_receiver)
-#   PA0       dummy remote_receiver – ir_rf_proxy needs one to exist
+#   PA0       placeholder remote_receiver – ir_rf_proxy needs one; IRQ detached at boot
 #   PA19      radar wake pin (radar header P19)
 #   PA7       pinhole button (low at rest, high when pressed)
 #   PA11/PA14 OPT3004 SCL/SDA, bit-banged I²C, addr 0x44
@@ -35,7 +35,7 @@ esphome:
   comment: LinknLink eMotion Max 2 (ADT6101P)
   project:
     name: BlairC1.emotion-max-2-esphome
-    version: "1.0.0"
+    version: "1.1.0"
   platformio_options:
     build_flags:
       # generic-rtl8720cf only defines alternative UART1 pins (PIN_SERIAL1_RX_0/_1),
@@ -58,15 +58,33 @@ esphome:
         - script.execute: led_status
     - priority: -100
       then:
+        # Disarm the placeholder IR receiver on PA0. Its interrupt handler calls
+        # digitalRead(), which on LibreTiny/RTL8720C frees the pin's interrupt
+        # inside the ISR and reuses an already-freed GPIO object – heap
+        # corruption if PA0 ever sees an edge (it floats: attachInterrupt drops
+        # the pull-down). ir_rf_proxy only needs the receiver object to exist.
+        - lambda: 'detachInterrupt(0);'
         # Safety net – restored numbers/switch normally trigger this already
         # during setup; mode: restart folds the calls into one write.
         - script.execute: apply_height_window
 
 rtl87xx:
   board: generic-rtl8720cf-2mb-992k
+  framework:
+    options:
+      # LibreTiny's serial RX ring buffer is a compile-time constant (256 bytes by
+      # default – uart: rx_buffer_size is ignored on LibreTiny). 256 bytes is only
+      # ~22 ms of radar data at 115200, so any longer stall in the main loop drops
+      # bytes and can throw the ld6002b parser off. 2048 ≈ 180 ms of headroom.
+      LT_SERIAL_BUFFER_SIZE: 2048
 
 logger:
   level: INFO               # DEBUG logs every state publish – costly on this chip
+  # No serial logging: on LibreTiny each log line is written to UART2 with a
+  # busy-wait (~1 ms per 11 characters at 115200), stalling the main loop – and
+  # the radar UART – for every state log. Logs over the API (ESPHome dashboard,
+  # `esphome logs`) are unaffected. Set back to 115200 for bench debugging.
+  baud_rate: 0
 
 api:
   encryption:
@@ -135,13 +153,25 @@ globals:
   - id: th_scan_req
     type: bool
     initial_value: 'false'
+  - id: radar_rx_bytes       # bytes received from the radar – feeds "Radar Data Rate"
+    type: uint32_t
+    initial_value: '0'
 
 uart:
   id: radar_uart
   rx_pin: PA2
   tx_pin: PA3
   baud_rate: 115200
-  rx_buffer_size: 1024
+  # (rx_buffer_size does nothing on LibreTiny – see LT_SERIAL_BUFFER_SIZE above)
+  # Diagnostics: count what the radar sends for "Radar Data Rate" (ld6002b
+  # still gets every byte).
+  debug:
+    direction: RX
+    dummy_receiver: false
+    after:
+      timeout: 20ms
+    sequence:
+      - lambda: 'id(radar_rx_bytes) += bytes.size();'
 
 # ---------------------------------------------------------------------------
 # Radar – native component (framing, command queue with ACK/retry,
@@ -169,14 +199,10 @@ remote_transmitter:
 
 remote_receiver:
   id: ir_rx_dummy
-  # Never receives anything – ir_rf_proxy just needs a receiver to exist.
-  # PA0 is the download-mode strap (high = download), so pull it down, never up;
-  # the pull-down also stops a floating pad firing interrupts.
-  pin:
-    number: PA0
-    mode:
-      input: true
-      pulldown: true
+  # Never receives anything – ir_rf_proxy just needs a receiver to exist. Its
+  # interrupt is detached at boot (see on_boot). PA0 is the download-mode strap;
+  # it is only ever an input here.
+  pin: PA0
 
 infrared:
   - platform: ir_rf_proxy
@@ -614,6 +640,31 @@ sensor:
     device_class: humidity
     state_class: measurement
     unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+
+  # ---- Diagnostics ----
+  - platform: uptime           # a reset to ~0 means the device rebooted
+    name: Uptime
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: wifi_signal
+    name: Wi-Fi Signal
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: template
+    id: radar_resyncs
+    name: Radar Parser Resyncs  # counts since boot; >0 confirms the parser-stall theory
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: radar_data_rate
+    name: Radar Data Rate      # 0 = the radar has stopped talking
+    entity_category: diagnostic
+    unit_of_measurement: B/s
+    state_class: measurement
     accuracy_decimals: 0
     update_interval: never
 
@@ -1177,6 +1228,52 @@ text:
 
 interval:
   # -------------------------------------------------------------------------
+  # Radar watchdog: publishes the radar's data rate every 10 s, logs when the
+  # radar goes quiet and when it comes back, and un-sticks the ld6002b parser.
+  #
+  # Parser stall: if bytes are lost, the parser can lock onto a false frame
+  # start whose 1-byte header checksum happens to match (1 in 256). The bogus
+  # length is usually over its 1 KB limit, so it logs "Frame too large" and
+  # silently skips that many bytes (up to 64 KB) – minutes of radar data,
+  # including every command ACK. Real oversized frames don't occur here (point
+  # cloud is off), so a large skip is always bogus: reset the parser. Reaching
+  # the component's protected state needs the small Peek helper below.
+  # -------------------------------------------------------------------------
+  - interval: 10s
+    then:
+      - lambda: |-
+          struct Peek : public ld6002b::LD6002BComponent {
+            static uint32_t skipping(ld6002b::LD6002BComponent *c) {
+              auto *p = static_cast<Peek *>(c);
+              return p->parse_state_ == ParseState::DISCARD ? p->discard_remaining_ : 0;
+            }
+            static void resync(ld6002b::LD6002BComponent *c) { static_cast<Peek *>(c)->reset_parser_(); }
+          };
+          if (std::isnan(id(radar_resyncs).state)) id(radar_resyncs).publish_state(0);
+          uint32_t skip = Peek::skipping(id(adt_radar));
+          if (skip > 2048) {
+            Peek::resync(id(adt_radar));
+            id(radar_resyncs).publish_state(id(radar_resyncs).state + 1);
+            ESP_LOGW("radar", "Parser was skipping %u bytes of a bogus frame – resynced", (unsigned) skip);
+          }
+
+          static uint32_t silent_since = 0;
+          uint32_t b = id(radar_rx_bytes);
+          id(radar_rx_bytes) = 0;
+          float rate = b / 10.0f;
+          if (std::isnan(id(radar_data_rate).state) || fabsf(rate - id(radar_data_rate).state) >= 20.0f || (b == 0) != (id(radar_data_rate).state == 0))
+            id(radar_data_rate).publish_state(rate);
+          if (b == 0 && silent_since == 0) {
+            silent_since = millis();
+            // Bytes waiting unread = the radar IS talking but ld6002b isn't reading
+            ESP_LOGW("radar", "No radar data read in 10 s (%u bytes waiting unread)",
+                     (unsigned) id(radar_uart).available());
+          } else if (b > 0 && silent_since != 0) {
+            ESP_LOGW("radar", "Radar sending again after %u s of silence", (unsigned) ((millis() - silent_since) / 1000));
+            silent_since = 0;
+          }
+
+  # -------------------------------------------------------------------------
   # Zone engine
   # -------------------------------------------------------------------------
   - interval: 50ms
@@ -1483,7 +1580,7 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          static const int cand[] = { 0, 8, 9, 10, 13, 20, 23 };   // GPIOs not used elsewhere
+          static const int cand[] = { 8, 9, 10, 13, 20, 23 };   // free GPIOs. Never PA0: its placeholder IRQ left a freed GPIO object behind, so pinMode() there would corrupt the heap
           static uint32_t tick = 0;
           static bool first = true, pending = false;
           static int type = 0;                // 0 = not identified, 3 = SHT3x, 4 = SHT4x
@@ -1569,7 +1666,7 @@ interval:
                   if (probe(ad)) { fs = a; fc = b; fa = ad; break; }
               }
             }
-            for (int p : up) pinMode(p, p == 0 ? INPUT_PULLDOWN : INPUT);   // PA0: back to its pull-down
+            for (int p : up) pinMode(p, INPUT);
 
             if (fa == 0x44 || fa == 0x45) {
               ESP_LOGI("th", "Found a sensor at 0x%02X: SDA=PA%d SCL=PA%d – saved", fa, fs, fc);
@@ -1582,7 +1679,7 @@ interval:
               snprintf(buf, sizeof(buf), "Unknown chip 0x%02X on SDA PA%d, SCL PA%d", fa, fs, fc);
               id(th_bus).publish_state(buf);
             } else {
-              ESP_LOGW("th", "No sensor found on PA0/8/9/10/13/20/23 – send this log");
+              ESP_LOGW("th", "No sensor found on PA8/9/10/13/20/23 – send this log");
               id(th_bus).publish_state("Scan found nothing – see log");
             }
             return;
