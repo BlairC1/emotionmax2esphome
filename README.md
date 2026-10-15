@@ -172,7 +172,7 @@ These are stored in the radar's own flash: **Radar Sensitivity**, **Trigger Spee
 
 LinknLink's THS cable, and Broadlink's HTS2 from the same family, put a Sensirion SHTC3 on the USB data lines. Those lines reach PA19/PA20 as an I²C bus. Plug the cable in and it's detected automatically. The config tries both SDA/SCL orientations and also recognises SHT3x/SHT4x sensors at 0x44/0x45.
 
-- **Temperature** and **Humidity** are read every 15 s. They're published on a change (0.1 °C / 1 %RH) or every 5 minutes.
+- **Temperature** and **Humidity** are read every 15 s. Every reading is published.
 - **Temperature Offset** calibrates against a reference thermometer.
 - **Temperature Sensor Bus** (diagnostic) shows what was found, e.g. `SHTC3 at 0x70 – SDA PA20, SCL PA19`.
 - Unplugging the cable makes the readings unavailable, and they come back when it's reconnected.

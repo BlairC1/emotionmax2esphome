@@ -636,7 +636,7 @@ sensor:
     device_class: humidity
     state_class: measurement
     unit_of_measurement: "%"
-    accuracy_decimals: 0
+    accuracy_decimals: 1
     update_interval: never
 
   # ---- Diagnostics ----
@@ -1579,7 +1579,7 @@ interval:
   # (0x70). SHT3x/SHT4x (0x44/0x45) are also handled in case another cable
   # uses one. Bit-banged like the OPT3004.
   #
-  # Not found yet / unplugged: every 15 s it probes both SDA/SCL orientations
+  # Reads (and publishes) every 15 s. Not found yet / unplugged: it probes both SDA/SCL orientations
   # (safe – these pins only go to the USB connector). Found: each 15 s pass
   # collects the previous measurement and starts the next, so nothing blocks.
   # -------------------------------------------------------------------------
@@ -1592,7 +1592,6 @@ interval:
           static uint32_t tick = 14;          // first attempt on the next pass
           static bool pending = false;
           static uint8_t fails = 0;
-          static uint32_t last_t_pub = 0, last_h_pub = 0;
           if (++tick % 15 != 0) return;
 
           auto lo  = [](int p) { pinMode(p, OUTPUT); digitalWrite(p, LOW); };
@@ -1708,16 +1707,9 @@ interval:
               float t = -45.0f + 175.0f * rt / 65535.0f + id(temp_offset).state;
               float h = (type == 4) ? -6.0f + 125.0f * rh / 65535.0f : 100.0f * rh / 65535.0f;
               h = std::min(100.0f, std::max(0.0f, h));
-              // Publish real changes (0.1 °C / 1 %RH) or every 5 min as a heartbeat
-              float lt = id(room_temperature).state, lh = id(room_humidity).state;
-              if (std::isnan(lt) || fabsf(t - lt) >= 0.1f || millis() - last_t_pub >= 300000UL) {
-                id(room_temperature).publish_state(t);
-                last_t_pub = millis();
-              }
-              if (std::isnan(lh) || fabsf(h - lh) >= 1.0f || millis() - last_h_pub >= 300000UL) {
-                id(room_humidity).publish_state(h);
-                last_h_pub = millis();
-              }
+              // Every reading is published (like ESPHome's own SHT components)
+              id(room_temperature).publish_state(t);
+              id(room_humidity).publish_state(h);
             }
             if (type == 0) return;
           }
