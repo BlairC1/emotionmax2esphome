@@ -10,7 +10,7 @@ Everything the stock firmware did is supported, plus a few things it didn't:
 - **IR blaster and receiver** as a native Home Assistant infrared proxy (HA 2026.4+), plus learn/replay and NEC/raw send actions
 - **Ambient light** (OPT3004)
 - **Status LED** (red/blue) and pinhole button
-- **Temperature/humidity** via a USB sensor cable *(work in progress, see below)*
+- **Temperature/humidity** via LinknLink's THS or Broadlink's HTS2 USB sensor cable (SHTC3)
 
 The whole config is a single YAML file with lambdas: no external components and no LibreTiny fork.
 
@@ -25,6 +25,7 @@ The whole config is a single YAML file with lambdas: no external components and 
 | Wi-Fi/BLE module | LinknLink **LL8720-P** (LL8720-P_1V3, P/N 60001): Realtek **RTL8720CF** (AmebaZ2), Cortex-M33 @ 100 MHz, 256 KB RAM, 2 MB flash |
 | Radar | **ADTM6101PJDM41P04** (V1.0-221223): Andar **ADT6101P** 60 GHz 2T2R, up to 3 tracked targets. It speaks the same TinyFrame protocol as the Hi-Link LD6002B, so ESPHome's native [`ld6002b`](https://esphome.io/components/sensor/ld6002b/) component works unchanged |
 | Light sensor | TI OPT3004 (I²C, 0x44) |
+| Temperature/humidity *(optional)* | LinknLink THS / Broadlink HTS2 USB cable: Sensirion SHTC3 (I²C, 0x70) on the USB D+/D− lines |
 | IR | IR LED blaster + 38 kHz IR receiver |
 | LED | Red/blue bi-colour, common anode |
 | Power | 5 V USB, 1117-type 3.3 V LDO (the radar can peak at ~600 mA) |
@@ -40,16 +41,17 @@ The radar board is mounted **upside down** in the enclosure, so the radar's X an
 | PA2 / PA3 | Radar UART RX / TX | Hardware UART1 (needs the build flags in the config) |
 | PA4 | IR LEDs | `remote_transmitter`, hardware PWM carrier |
 | PA18 | IR receiver | Custom edge-timestamp ISR (see Known issues) |
-| PA19 | Radar wake pin | Radar header P19; needed for low-power mode |
 | PA7 | Pinhole button | Low at rest, high when pressed |
 | PA11 / PA14 | OPT3004 SCL / SDA | Bit-banged; PA14 has no hardware I²C function |
 | PA12 | LED red | PWM, active low |
 | PA17 | LED blue | PWM, active low |
 | PA15 / PA16 | Log UART2 RX / TX | Used for flashing. Serial logging is off in the config (see Known issues) |
 | PA0 | Download-mode strap | High at power-on = download mode. Placeholder IR receiver pin; its interrupt is detached at boot (see Known issues) |
-| USB D+ / D− | Temperature cable I²C | Not mapped yet. The config's scan button finds them |
+| PA19 / PA20 | USB D+ / D− → temperature cable I²C | Bit-banged; SDA/SCL orientation is detected at boot. These are the chip's I²C0 pins |
 
-Free GPIOs: PA8, PA9, PA10, PA13, PA20, PA23 (not all are necessarily broken out).
+Free GPIOs: PA8, PA9, PA10, PA13, PA23 (not all are necessarily broken out).
+
+The radar header's wake pin (P19) isn't connected to the Wi-Fi module, so there's no wake line.
 
 ---
 
@@ -142,7 +144,7 @@ Heights are measured from the centre of a person's radar reflection (roughly the
 
 These are stored in the radar's own flash: **Radar Sensitivity**, **Trigger Speed**, **Hold Delay**, **Installation Mode**, **Auto/Clear Interference** (learns static reflectors) and **Reset Detection Areas**.
 
-**Radar Low Power** makes the radar sleep between short measurements. It runs cooler and uses less power, but it's slower to respond and can lose still people, so it suits "asleep" or "away". It always turns off at boot.
+**Radar Low Power** makes the radar sleep between short measurements. It runs cooler and uses less power, but it's slower to respond and can lose still people, so it suits "asleep" or "away". It always turns off at boot. There's no wake line to the radar (see Pin map), so if the switch occasionally fails to turn low-power off, toggle it again.
 
 ### Infrared
 
@@ -166,19 +168,30 @@ These are stored in the radar's own flash: **Radar Sensitivity**, **Trigger Spee
 - **LED**: flashes blue while booting until Home Assistant connects, then goes off. It turns solid red if HA has been disconnected for 10 s. Otherwise it's yours to control from HA as an RGB light (green does nothing, because the LED has no green die).
 - **Button**: hold 5–10 s to restart; hold for more than 10 s to factory reset.
 
-### Temperature / humidity *(work in progress)*
+### Temperature / humidity
 
-LinknLink's THS cable (and Broadlink's HTS2, from the same family) puts an SHT3x-class sensor on the USB data lines. Which GPIOs the eMotion's D+/D− reach hasn't been mapped yet. With the cable plugged in, press **Temperature Sensor Scan**: it probes the free GPIOs and saves the bus it finds. The result shows in **Temperature Sensor Bus**.
+LinknLink's THS cable, and Broadlink's HTS2 from the same family, put a Sensirion SHTC3 on the USB data lines. Those lines reach PA19/PA20 as an I²C bus. Plug the cable in and it's detected automatically. The config tries both SDA/SCL orientations and also recognises SHT3x/SHT4x sensors at 0x44/0x45.
 
-The scan briefly drives unknown pins, so it only runs when you press the button. If the radar stops responding afterwards, power-cycle the device.
+- **Temperature** and **Humidity** are read every 15 s. They're published on a change (0.1 °C / 1 %RH) or every 5 minutes.
+- **Temperature Offset** calibrates against a reference thermometer.
+- **Temperature Sensor Bus** (diagnostic) shows what was found, e.g. `SHTC3 at 0x70 – SDA PA20, SCL PA19`.
+- Unplugging the cable makes the readings unavailable, and they come back when it's reconnected.
 
 ### Diagnostics
 
 - **Radar Data Rate** (B/s): bytes per second arriving from the radar. 0 means the radar has gone silent.
 - **Radar Parser Resyncs**: how many times since boot the parser watchdog has unstuck the radar parser (see Known issues).
 - **Uptime** and **Wi-Fi Signal**: Uptime dropping back to ~0 means the device rebooted.
+- **Loop Time**: the longest gap between main-loop passes in each 30 s window. Normally it's about 16–30 ms; repeated spikes far above that mean something is blocking the CPU.
+- **Free Heap**: a steady downward trend over days would mean a memory leak.
 
-The log also warns when the radar stops sending data and says how long the silence lasted.
+The log also:
+- warns when the radar stops sending data, and says how long the silence lasted;
+- logs where the radar first saw someone each time presence turns on, e.g. `Presence ON – first seen at x=-950 y=3100 mm`.
+
+**Diagnosing a slow response on entry:**
+- **First seen at the doorway:** the radar reacted promptly, so the delay is downstream: Wi-Fi, Home Assistant, the automation or the light. HA's automation traces show where.
+- **First seen well inside the room:** the radar was slow to acquire. Try **Radar Trigger Speed** fast and **Radar Sensitivity** high. Also check that the doorway is inside the detection area, the height window and **Max Distance**.
 
 ---
 
@@ -193,10 +206,11 @@ The log also warns when the radar stops sending data and says how long the silen
 - **The radar sometimes stops responding after an OTA update.** The log shows every `ld6002b` command timing out. An OTA only restarts the Wi-Fi chip; the radar stays powered, and stray data on its RX line during the reboot can wedge it. ESPHome's `ld6002b` docs note the module has no reset pin or reset command. Some of these cases may actually be the parser stall above, so try the **Restart** button first. If that doesn't clear it, unplug the device for 10 s.
 - **LibreTiny: `generic-rtl8720cf` doesn't define the UART1 pins** (only `PIN_SERIAL1_RX_0/_1`), so ESPHome silently falls back to software serial. The config's `-DPIN_SERIAL1_RX=2u` / `-DPIN_SERIAL1_TX=3u` build flags fix this.
 - **LibreTiny: calling `digitalRead()` inside an interrupt handler tears down the pin interrupt on RTL8720C**, which breaks ESPHome's `remote_receiver`. The config receives IR with its own ISR that only timestamps edges (CHANGE fires on both edges on this chip). The decoded data goes to the `ir_rf_proxy` receiver.
-- **LibreTiny: freed pin objects are reused** ([#404](https://github.com/libretiny-eu/libretiny/issues/404)). On RTL8720C, attaching an interrupt frees the pin's GPIO object but leaves a dangling pointer. Any later `pinMode()` or `digitalRead()` on that pin then corrupts the heap. That makes the placeholder `remote_receiver` on PA0 (which exists only because `ir_rf_proxy` requires one) a hazard: its interrupt handler calls `digitalRead()`, and the pin floats because attaching the interrupt drops the pull-down. The config detaches its interrupt at boot, and the temperature scan never touches PA0. Never switch a `libretiny_pwm` pin to another mode either.
+- **LibreTiny: freed pin objects are reused** ([#404](https://github.com/libretiny-eu/libretiny/issues/404)). On RTL8720C, attaching an interrupt frees the pin's GPIO object but leaves a dangling pointer. Any later `pinMode()` or `digitalRead()` on that pin then corrupts the heap. That makes the placeholder `remote_receiver` on PA0 (which exists only because `ir_rf_proxy` requires one) a hazard: its interrupt handler calls `digitalRead()`, and the pin floats because attaching the interrupt drops the pull-down. The config detaches its interrupt at boot, and nothing else in the config touches PA0. Never switch a `libretiny_pwm` pin to another mode either.
 - **LibreTiny: RTL8720C support is still young.** LibreTiny's own support table rates it 2/5 for stability, with Wi-Fi, PWM, interrupts and the watchdog marked untested. Also open: [#396](https://github.com/libretiny-eu/libretiny/issues/396), where a restart or OTA can hang the chip itself until it's power-cycled.
+- **Faint glow from an "off" LED (fixed in the config):** ESPHome's `libretiny_pwm` writes "full" as 1023/1024, because it scales to 2^bits − 1 while LibreTiny divides by 2^bits. An inverted, common-anode LED that should be off therefore gets a 0.1 % pulse each period, which shows as a faint purple. The light drives small template outputs that write a true 100 % (`analogWrite(pin, 1 << 10)`) for off.
 - **Power supply:** the radar peaks at about 600 mA through the board's linear regulator. Use a decent 5 V 2 A supply and cable; brownouts can upset the radar.
-- **No hardware I²C** for the light sensor or temperature cable: their pins don't have I²C functions, and ESPHome's `i2c:` on LibreTiny is hardware-only. Both are bit-banged in lambdas, which costs well under 1 ms per read.
+- **Bit-banged I²C:** the light sensor's SDA (PA14) has no I²C function. ESPHome's `i2c:` on LibreTiny is hardware-only, and RTL8720C I²C is untested in LibreTiny. So both buses are bit-banged in lambdas, at well under 1 ms of work per read. That includes the temperature cable, even though PA19/PA20 are hardware I²C0 pins.
 - **Bluetooth**: the RTL8720CF has BLE 4.2, but LibreTiny has no Bluetooth support for it, so it's unused.
 - **Wi-Fi power save** defaults to `none` on RTL87xx. The config sets `power_save_mode: light`.
 

@@ -12,15 +12,15 @@
 #   PA18      IR receiver – own edge-timestamping ISR (LibreTiny digitalRead()
 #             tears down the pin interrupt on RTL8720C, breaking remote_receiver)
 #   PA0       placeholder remote_receiver – ir_rf_proxy needs one; IRQ detached at boot
-#   PA19      radar wake pin (radar header P19)
 #   PA7       pinhole button (low at rest, high when pressed)
 #   PA11/PA14 OPT3004 SCL/SDA, bit-banged I²C, addr 0x44
 #   PA12      status LED red  (common anode → active low, PWM1)
 #   PA17      status LED blue (PWM5) – red/blue bi-colour LED, no green die
 #   PA15/PA16 log UART (UART2)
-#   ?         USB D+/D- – temperature/humidity cable (Broadlink HTS2 / LinknLink
-#             THS, SHT3x/SHT4x expected). Pins not mapped yet: press "Temperature
-#             Sensor Scan" with the cable plugged in and it finds and saves them.
+#   PA19/PA20 USB D+/D- – I²C to the temperature/humidity cable (Broadlink HTS2
+#             / LinknLink THS, SHTC3 at 0x70), bit-banged. SDA/SCL orientation
+#             is detected at boot. (Not the radar wake pin – the radar's P19
+#             isn't wired to the Wi-Fi module.)
 #
 # The radar board sits upside down in the enclosure (radar X and Z inverted):
 # keep Upside Down Mounting on.
@@ -35,7 +35,7 @@ esphome:
   comment: LinknLink eMotion Max 2 (ADT6101P)
   project:
     name: BlairC1.emotion-max-2-esphome
-    version: "1.1.0"
+    version: "1.2.0"
   platformio_options:
     build_flags:
       # generic-rtl8720cf only defines alternative UART1 pins (PIN_SERIAL1_RX_0/_1),
@@ -128,6 +128,9 @@ wifi:
   password: !secret wifi_password
   power_save_mode: light    # radio sleeps between beacons (RTL87xx default is none)
 
+debug:
+  update_interval: 30s
+
 globals:
   - id: ir_last_tx_ms        # end of our last IR transmission – receiver ignores echoes
     type: uint32_t
@@ -135,22 +138,6 @@ globals:
   - id: ir_last_raw          # last code received on PA18 – replayed by "IR Replay Last Code"
     type: std::vector<int32_t>
   - id: led_alert            # LED is showing boot flash / HA-lost red (not a colour set from HA)
-    type: bool
-    initial_value: 'false'
-  # Temperature cable bus, found by "Temperature Sensor Scan" and kept across reboots
-  - id: th_sda
-    type: int
-    restore_value: true
-    initial_value: '-1'
-  - id: th_scl
-    type: int
-    restore_value: true
-    initial_value: '-1'
-  - id: th_addr
-    type: int
-    restore_value: true
-    initial_value: '0'
-  - id: th_scan_req
     type: bool
     initial_value: 'false'
   - id: radar_rx_bytes       # bytes received from the radar – feeds "Radar Data Rate"
@@ -180,11 +167,10 @@ uart:
 ld6002b:
   id: adt_radar
   uart_id: radar_uart
-  # Radar wake pin (radar header P19). Before each command the component pulses
-  # it so a radar in low-power sleep wakes and listens. 200 ms rather than the
-  # 50 ms default: with 50 ms the radar woke but occasionally missed the command.
-  wakeup_pin: PA19
-  wakeup_pulse: 200ms
+  # No wakeup_pin: the radar's wake line (P19) isn't connected to the Wi-Fi
+  # module – PA19 is actually the USB-cable I²C bus. In low-power mode the
+  # component's ACK/retry handles a sleeping radar; if Radar Low Power ever
+  # fails to switch off, just toggle it again.
 
 # ---------------------------------------------------------------------------
 # Infrared – native Home Assistant infrared entities via ir_rf_proxy
@@ -223,14 +209,33 @@ infrared:
 #   HA lost for 10 s (or never connected after boot): solid red
 # ---------------------------------------------------------------------------
 output:
+  # Faint purple glow fix. ESPHome's libretiny_pwm writes "full" as 1023/1024
+  # (it scales to 2^bits − 1, LibreTiny divides by 2^bits), so an inverted
+  # (common-anode) LED that should be off still gets a 0.1 % low pulse every
+  # period. The PWM outputs below do the setup; the template outputs the light
+  # uses write a true 100 % (1024/1024) duty – pin held high – for off.
   - platform: libretiny_pwm
-    id: led_r
+    id: led_r_pwm
     pin: PA12
     inverted: true
   - platform: libretiny_pwm
-    id: led_b
+    id: led_b_pwm
     pin: PA17
     inverted: true
+  - platform: template
+    id: led_r
+    type: float
+    write_action:
+      - lambda: |-
+          if (state <= 0.0f) analogWrite(12, 1 << 10);   // PA12 fully high = off
+          else id(led_r_pwm).set_level(state);
+  - platform: template
+    id: led_b
+    type: float
+    write_action:
+      - lambda: |-
+          if (state <= 0.0f) analogWrite(17, 1 << 10);   // PA17 fully high = off
+          else id(led_b_pwm).set_level(state);
   - platform: template
     id: led_g
     type: float
@@ -366,15 +371,6 @@ button:
     id: do_factory_reset
     name: Factory Reset
     entity_category: config
-  # Probes the free GPIOs for the USB-cable sensor. Press with the cable plugged
-  # in; the result shows in "Temperature Sensor Bus" and is saved.
-  - platform: template
-    id: th_scan
-    name: Temperature Sensor Scan
-    icon: mdi:magnify-scan
-    entity_category: config
-    on_press:
-      - lambda: 'id(th_scan_req) = true;'
 
   # Hisense A40KAU (VIDAA) – NEC address 0xBF00. Discrete on/off verified to wake
   # the TV from deep standby; codes from hawkins.id.au, converted to ESPHome order.
@@ -644,6 +640,13 @@ sensor:
     update_interval: never
 
   # ---- Diagnostics ----
+  # Loop Time = the longest gap between main-loop passes in each 30 s window.
+  # Normally ~16-30 ms; spikes well above that mean something blocked the CPU.
+  - platform: debug
+    free:
+      name: Free Heap
+    loop_time:
+      name: Loop Time
   - platform: uptime           # a reset to ~0 means the device rebooted
     name: Uptime
     entity_category: diagnostic
@@ -1380,6 +1383,15 @@ interval:
           }
 
           // ---- Presence: immediate (binary sensors only send on change) ----
+          // Entry trace: where the radar first saw someone. A first position
+          // deep inside the room means the radar was slow to pick them up;
+          // one at the doorway means any delay is downstream (Wi-Fi/HA).
+          static bool was_active = false;
+          if (active > 0 && !was_active) {
+            for (int t = 0; t < 3; t++)
+              if (det[t]) { ESP_LOGI("entry", "Presence ON – first seen at x=%d y=%d mm", (int) px[t], (int) py[t]); break; }
+          }
+          was_active = active > 0;
           id(occupancy).publish_state(active > 0);
           binary_sensor::BinarySensor *zbin[4] = { id(zone1_occupancy), id(zone2_occupancy), id(zone3_occupancy), id(zone4_occupancy) };
           for (int z = 0; z < 4; z++) zbin[z]->publish_state(zc[z] > 0);
@@ -1563,30 +1575,25 @@ interval:
           }
   # -------------------------------------------------------------------------
   # Temperature/humidity cable on the USB data lines (Broadlink HTS2 /
-  # LinknLink THS – an SHT3x-class sensor talking I2C over D+/D-, powered from
-  # the charger's 5 V). Bit-banged like the OPT3004.
+  # LinknLink THS). D+/D- are PA19/PA20; the cable carries a Sensirion SHTC3
+  # (0x70). SHT3x/SHT4x (0x44/0x45) are also handled in case another cable
+  # uses one. Bit-banged like the OPT3004.
   #
-  # Which GPIOs D+/D- reach isn't mapped, so "Temperature Sensor Scan" works
-  # it out: it checks the unused pins below, skips any that something holds
-  # low, then tries each pair as SDA/SCL looking for a sensor. Found pins are
-  # saved (globals th_sda/th_scl/th_addr) and used from then on. The scan only
-  # runs when you press the button, because it briefly pulls unknown pins low –
-  # if one of them turned out to be wired to the radar, the radar could need a
-  # power cycle afterwards.
-  #
-  # Reads every 15 s without blocking: each pass collects the previous
-  # measurement and starts the next one.
+  # Not found yet / unplugged: every 15 s it probes both SDA/SCL orientations
+  # (safe – these pins only go to the USB connector). Found: each 15 s pass
+  # collects the previous measurement and starts the next, so nothing blocks.
   # -------------------------------------------------------------------------
   - interval: 1s
     then:
       - lambda: |-
-          static const int cand[] = { 8, 9, 10, 13, 20, 23 };   // free GPIOs. Never PA0: its placeholder IRQ left a freed GPIO object behind, so pinMode() there would corrupt the heap
-          static uint32_t tick = 0;
-          static bool first = true, pending = false;
-          static int type = 0;                // 0 = not identified, 3 = SHT3x, 4 = SHT4x
+          static int sda = -1, scl = -1;      // set by detection
+          static uint8_t ad = 0;
+          static int type = 0;                // 0 = none, 3 = SHT3x, 4 = SHT4x, 5 = SHTC3
+          static uint32_t tick = 14;          // first attempt on the next pass
+          static bool pending = false;
           static uint8_t fails = 0;
           static uint32_t last_t_pub = 0, last_h_pub = 0;
-          int sda = id(th_sda), scl = id(th_scl);
+          if (++tick % 15 != 0) return;
 
           auto lo  = [](int p) { pinMode(p, OUTPUT); digitalWrite(p, LOW); };
           auto rel = [](int p) { pinMode(p, INPUT_PULLUP); };   // internal pull-up helps on a 2 m cable
@@ -1620,7 +1627,12 @@ interval:
             dly(); scl_hi(); dly(); lo(scl); rel(sda);
             return b;
           };
-          auto probe = [&](uint8_t a) -> bool { start(); bool ok = wr(a << 1); stop(); return ok; };
+          auto cmd = [&](uint8_t a, uint16_t c, bool two) -> bool {   // write a 1- or 2-byte command
+            start();
+            bool ok = wr(a << 1) && (two ? (wr(c >> 8) && wr(c & 0xFF)) : wr(c & 0xFF));
+            stop();
+            return ok;
+          };
           auto crc8 = [](uint8_t a, uint8_t b) -> uint8_t {   // Sensirion CRC-8, poly 0x31
             uint8_t c = 0xFF, d[2] = { a, b };
             for (int i = 0; i < 2; i++) {
@@ -1629,76 +1641,55 @@ interval:
             }
             return c;
           };
-          auto show = [](int s, int c, int a) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "SDA PA%d, SCL PA%d, address 0x%02X", s, c, a);
-            id(th_bus).publish_state(buf);
-          };
 
-          if (first) {
-            first = false;
-            if (sda >= 0 && scl >= 0) show(sda, scl, id(th_addr));
-            else id(th_bus).publish_state("Not found yet – plug in the cable and press Temperature Sensor Scan");
-          }
-
-          // ---- Scan (button) ----
-          if (id(th_scan_req)) {
-            id(th_scan_req) = false;
-            ESP_LOGI("th", "Scanning free GPIOs for the temperature cable...");
-            std::vector<int> up;
-            for (int p : cand) {
-              pinMode(p, INPUT);        delayMicroseconds(200); bool f = rd(p);
-              pinMode(p, INPUT_PULLUP); delayMicroseconds(500); bool u = rd(p);
-              pinMode(p, INPUT);
-              ESP_LOGI("th", "  PA%d: %s on its own, %s with pull-up%s", p, f ? "high" : "low",
-                       u ? "high" : "low", u ? "" : " – held low by something, skipped");
-              if (u) up.push_back(p);
-            }
-            static const uint8_t addrs[] = { 0x44, 0x45, 0x38, 0x40, 0x70 };
-            int fs = -1, fc = -1, fa = -1;
-            for (int a : up) {
-              for (int b : up) {
-                if (a == b || fs >= 0) continue;
-                sda = a; scl = b;
-                rel(sda); rel(scl); dly();
-                if (probe(0x13)) continue;      // ACKs an address nothing uses = not a real bus
-                for (uint8_t ad : addrs)
-                  if (probe(ad)) { fs = a; fc = b; fa = ad; break; }
+          // ---- Detect: both orientations, SHTC3 then SHT3x/4x addresses ----
+          if (type == 0) {
+            static const int pins[2][2] = { { 20, 19 }, { 19, 20 } };   // { SDA, SCL }
+            static const uint8_t addrs[] = { 0x70, 0x44, 0x45 };
+            for (auto &pr : pins) {
+              sda = pr[0]; scl = pr[1];
+              rel(sda); rel(scl); dly();
+              cmd(0x70, 0x3517, true);            // SHTC3 wake-up (harmless if nothing's there)
+              delayMicroseconds(300);
+              for (uint8_t a : addrs) {
+                start(); bool ok = wr(a << 1); stop();
+                if (!ok) continue;
+                ad = a;
+                if (a == 0x70) type = 5;
+                else if (cmd(a, 0x2400, true)) type = 3;    // SHT3x single shot – starts a measurement
+                else if (cmd(a, 0xFD, false)) type = 4;     // SHT4x high precision
+                if (type) break;
               }
+              if (type) break;
             }
-            for (int p : up) pinMode(p, INPUT);
-
-            if (fa == 0x44 || fa == 0x45) {
-              ESP_LOGI("th", "Found a sensor at 0x%02X: SDA=PA%d SCL=PA%d – saved", fa, fs, fc);
-              id(th_sda) = fs; id(th_scl) = fc; id(th_addr) = fa;
-              type = 0; pending = false; fails = 0; tick = 14;   // start measuring on the next pass
-              show(fs, fc, fa);
-            } else if (fa > 0) {
-              ESP_LOGW("th", "Found an unexpected chip at 0x%02X (SDA=PA%d SCL=PA%d) – not an SHT; send this log", fa, fs, fc);
-              char buf[64];
-              snprintf(buf, sizeof(buf), "Unknown chip 0x%02X on SDA PA%d, SCL PA%d", fa, fs, fc);
-              id(th_bus).publish_state(buf);
-            } else {
-              ESP_LOGW("th", "No sensor found on PA8/9/10/13/20/23 – send this log");
-              id(th_bus).publish_state("Scan found nothing – see log");
+            if (!type) {
+              if (!std::isnan(id(room_temperature).state)) {
+                id(room_temperature).publish_state(NAN);
+                id(room_humidity).publish_state(NAN);
+              }
+              id(th_bus).publish_state("No sensor – cable unplugged?");
+              return;
             }
-            return;
+            static const char *const names[] = { "", "", "", "SHT3x", "SHT4x", "SHTC3" };
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s at 0x%02X – SDA PA%d, SCL PA%d", names[type], ad, sda, scl);
+            ESP_LOGI("th", "Temperature cable: %s", buf);
+            id(th_bus).publish_state(buf);
+            fails = 0;
+            pending = (type == 3 || type == 4);   // SHT3x/4x detection already started a measurement
+            if (pending) return;
           }
-
-          // ---- Measure every 15 s ----
-          if (sda < 0 || scl < 0) return;
-          if (++tick % 15 != 0) return;
-          const uint8_t ad = (uint8_t) id(th_addr);
 
           auto fail = [&](const char *why) {
             if (++fails == 3) {
               ESP_LOGW("th", "Temperature sensor not responding (%s) – unplugged?", why);
               id(room_temperature).publish_state(NAN);
               id(room_humidity).publish_state(NAN);
-              type = 0;                         // identify it again when it comes back
+              type = 0;                         // go back to detection
             }
           };
 
+          // ---- Collect the previous measurement ----
           if (pending) {
             pending = false;
             uint8_t d[6] = { 0 };
@@ -1706,12 +1697,12 @@ interval:
             bool ok = wr((ad << 1) | 1);
             if (ok) for (int i = 0; i < 6; i++) d[i] = rdb(i < 5);
             stop();
+            if (type == 5) cmd(ad, 0xB098, true);   // SHTC3 back to sleep
             if (!ok) {
               fail("no reply");
             } else if (crc8(d[0], d[1]) != d[2] || crc8(d[3], d[4]) != d[5]) {
               fail("bad checksum");
             } else {
-              if (fails >= 3) ESP_LOGI("th", "Temperature sensor back");
               fails = 0;
               uint16_t rt = (d[0] << 8) | d[1], rh = (d[3] << 8) | d[4];
               float t = -45.0f + 175.0f * rt / 65535.0f + id(temp_offset).state;
@@ -1728,17 +1719,19 @@ interval:
                 last_h_pub = millis();
               }
             }
+            if (type == 0) return;
           }
 
-          // Start the next measurement (identifying the chip first if needed)
+          // ---- Start the next measurement ----
           bool started = false;
-          if (type == 0 || type == 3) {
-            start(); started = wr(ad << 1) && wr(0x24) && wr(0x00); stop();   // SHT3x single shot, high rep.
-            if (started && type == 0) { type = 3; ESP_LOGI("th", "SHT3x-type sensor at 0x%02X", ad); }
-          }
-          if (!started && (type == 0 || type == 4)) {
-            start(); started = wr(ad << 1) && wr(0xFD); stop();               // SHT4x high precision
-            if (started && type == 0) { type = 4; ESP_LOGI("th", "SHT4x-type sensor at 0x%02X", ad); }
+          if (type == 5) {
+            cmd(ad, 0x3517, true);              // wake (may NACK if already awake)
+            delayMicroseconds(300);
+            started = cmd(ad, 0x7866, true);    // T first, normal mode, no clock stretching
+          } else if (type == 3) {
+            started = cmd(ad, 0x2400, true);
+          } else if (type == 4) {
+            started = cmd(ad, 0xFD, false);
           }
           if (started) pending = true;
           else fail("no ACK");
