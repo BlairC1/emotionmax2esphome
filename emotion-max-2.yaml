@@ -9,8 +9,8 @@
 # Pin map:
 #   PA2/PA3   radar UART (UART1 via build flags below)
 #   PA4       IR LEDs – remote_transmitter (hardware PWM carrier on RTL8720C)
-#   PA18      IR receiver – own edge-timestamping ISR (LibreTiny digitalRead()
-#             tears down the pin interrupt on RTL8720C, breaking remote_receiver)
+#   PA18      IR receiver – own edge-timestamping ISR (ESPHome's remote_receiver
+#             corrupts its buffer on RTL8720C – retested on 2026.11, still broken)
 #   PA0       placeholder remote_receiver – ir_rf_proxy needs one; IRQ detached at boot
 #   PA7       pinhole button (low at rest, high when pressed)
 #   PA11/PA14 OPT3004 SCL/SDA, bit-banged I²C, addr 0x44
@@ -35,7 +35,7 @@ esphome:
   comment: LinknLink eMotion Max 2 (ADT6101P)
   project:
     name: BlairC1.emotion-max-2-esphome
-    version: "1.2.0"
+    version: "1.3.0"
   platformio_options:
     build_flags:
       # generic-rtl8720cf only defines alternative UART1 pins (PIN_SERIAL1_RX_0/_1),
@@ -58,11 +58,9 @@ esphome:
         - script.execute: led_status
     - priority: -100
       then:
-        # Disarm the placeholder IR receiver on PA0. Its interrupt handler calls
-        # digitalRead(), which on LibreTiny/RTL8720C frees the pin's interrupt
-        # inside the ISR and reuses an already-freed GPIO object – heap
-        # corruption if PA0 ever sees an edge (it floats: attachInterrupt drops
-        # the pull-down). ir_rf_proxy only needs the receiver object to exist.
+        # Disarm the placeholder IR receiver on PA0 – ir_rf_proxy only needs the
+        # receiver object to exist, and PA0 floats (attachInterrupt drops the
+        # pull-down), so stray edges would feed it junk.
         - lambda: 'detachInterrupt(0);'
         # Safety net – restored numbers/switch normally trigger this already
         # during setup; mode: restart folds the calls into one write.
@@ -89,6 +87,10 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
+  # State changes are held and batched before sending (default 100 ms). 20 ms
+  # gets occupancy to Home Assistant sooner while changes published in the same
+  # loop pass (target X/Y etc.) still share a packet.
+  batch_delay: 20ms
   on_client_connected:
     - script.execute: led_status
   on_client_disconnected:
@@ -128,9 +130,6 @@ wifi:
   password: !secret wifi_password
   power_save_mode: light    # radio sleeps between beacons (RTL87xx default is none)
 
-debug:
-  update_interval: 30s
-
 globals:
   - id: ir_last_tx_ms        # end of our last IR transmission – receiver ignores echoes
     type: uint32_t
@@ -140,9 +139,6 @@ globals:
   - id: led_alert            # LED is showing boot flash / HA-lost red (not a colour set from HA)
     type: bool
     initial_value: 'false'
-  - id: radar_rx_bytes       # bytes received from the radar – feeds "Radar Data Rate"
-    type: uint32_t
-    initial_value: '0'
 
 uart:
   id: radar_uart
@@ -150,15 +146,6 @@ uart:
   tx_pin: PA3
   baud_rate: 115200
   # (rx_buffer_size does nothing on LibreTiny – see LT_SERIAL_BUFFER_SIZE above)
-  # Diagnostics: count what the radar sends for "Radar Data Rate" (ld6002b
-  # still gets every byte).
-  debug:
-    direction: RX
-    dummy_receiver: false
-    after:
-      timeout: 20ms
-    sequence:
-      - lambda: 'id(radar_rx_bytes) += bytes.size();'
 
 # ---------------------------------------------------------------------------
 # Radar – native component (framing, command queue with ACK/retry,
@@ -628,7 +615,7 @@ sensor:
     device_class: temperature
     state_class: measurement
     unit_of_measurement: °C
-    accuracy_decimals: 1
+    accuracy_decimals: 2
     update_interval: never
   - platform: template
     id: room_humidity
@@ -640,13 +627,6 @@ sensor:
     update_interval: never
 
   # ---- Diagnostics ----
-  # Loop Time = the longest gap between main-loop passes in each 30 s window.
-  # Normally ~16-30 ms; spikes well above that mean something blocked the CPU.
-  - platform: debug
-    free:
-      name: Free Heap
-    loop_time:
-      name: Loop Time
   - platform: uptime           # a reset to ~0 means the device rebooted
     name: Uptime
     entity_category: diagnostic
@@ -660,14 +640,6 @@ sensor:
     name: Radar Parser Resyncs  # counts since boot; >0 confirms the parser-stall theory
     entity_category: diagnostic
     state_class: total_increasing
-    accuracy_decimals: 0
-    update_interval: never
-  - platform: template
-    id: radar_data_rate
-    name: Radar Data Rate      # 0 = the radar has stopped talking
-    entity_category: diagnostic
-    unit_of_measurement: B/s
-    state_class: measurement
     accuracy_decimals: 0
     update_interval: never
 
@@ -1098,7 +1070,7 @@ number:
     unit_of_measurement: °C
     min_value: -10
     max_value: 10
-    step: 0.1
+    step: 0.01
     initial_value: 0
     optimistic: true
     restore_value: true
@@ -1149,6 +1121,7 @@ switch:
   - platform: ld6002b
     ld6002b_id: adt_radar
     low_power:
+      id: radar_low_power
       name: Radar Low Power
       restore_mode: ALWAYS_OFF
   - platform: template
@@ -1231,49 +1204,51 @@ text:
 
 interval:
   # -------------------------------------------------------------------------
-  # Radar watchdog: publishes the radar's data rate every 10 s, logs when the
-  # radar goes quiet and when it comes back, and un-sticks the ld6002b parser.
+  # Radar parser watchdog: un-sticks the ld6002b parser.
   #
   # Parser stall: if bytes are lost, the parser can lock onto a false frame
   # start whose 1-byte header checksum happens to match (1 in 256). The bogus
   # length is usually over its 1 KB limit, so it logs "Frame too large" and
   # silently skips that many bytes (up to 64 KB) – minutes of radar data,
-  # including every command ACK. Real oversized frames don't occur here (point
-  # cloud is off), so a large skip is always bogus: reset the parser. Reaching
-  # the component's protected state needs the small Peek helper below.
+  # including every command ACK. Still present in ESPHome 2026.11.
+  #
+  # In normal mode the radar sends frames continuously (~750 B/s even with the
+  # room empty), so 5 s with no valid frame means the parser is stuck: reset it.
+  # Skipped in low-power mode, where the radar legitimately goes quiet. The
+  # resync is counted when valid frames then resume.
+  #
+  # 2026.11 made LD6002BComponent final and moved the parser into the shared
+  # ld600x base class, so the helper derives from that base instead. It only
+  # reads last_traffic_ms_ and calls the parser's public reset().
   # -------------------------------------------------------------------------
-  - interval: 10s
+  - interval: 5s
     then:
       - lambda: |-
-          struct Peek : public ld6002b::LD6002BComponent {
-            static uint32_t skipping(ld6002b::LD6002BComponent *c) {
-              auto *p = static_cast<Peek *>(c);
-              return p->parse_state_ == ParseState::DISCARD ? p->discard_remaining_ : 0;
+          struct Peek : public ld600x::LD600XComponent {
+            static Peek *of(ld6002b::LD6002BComponent *c) {
+              return static_cast<Peek *>(static_cast<ld600x::LD600XComponent *>(c));
             }
-            static void resync(ld6002b::LD6002BComponent *c) { static_cast<Peek *>(c)->reset_parser_(); }
+            uint32_t last_frame_ms() const { return this->last_traffic_ms_; }
+            void resync() { this->parser_.reset(); }
           };
+          static uint32_t reset_at = 0;
           if (std::isnan(id(radar_resyncs).state)) id(radar_resyncs).publish_state(0);
-          uint32_t skip = Peek::skipping(id(adt_radar));
-          if (skip > 2048) {
-            Peek::resync(id(adt_radar));
-            id(radar_resyncs).publish_state(id(radar_resyncs).state + 1);
-            ESP_LOGW("radar", "Parser was skipping %u bytes of a bogus frame – resynced", (unsigned) skip);
-          }
 
-          static uint32_t silent_since = 0;
-          uint32_t b = id(radar_rx_bytes);
-          id(radar_rx_bytes) = 0;
-          float rate = b / 10.0f;
-          if (std::isnan(id(radar_data_rate).state) || fabsf(rate - id(radar_data_rate).state) >= 20.0f || (b == 0) != (id(radar_data_rate).state == 0))
-            id(radar_data_rate).publish_state(rate);
-          if (b == 0 && silent_since == 0) {
-            silent_since = millis();
-            // Bytes waiting unread = the radar IS talking but ld6002b isn't reading
-            ESP_LOGW("radar", "No radar data read in 10 s (%u bytes waiting unread)",
-                     (unsigned) id(radar_uart).available());
-          } else if (b > 0 && silent_since != 0) {
-            ESP_LOGW("radar", "Radar sending again after %u s of silence", (unsigned) ((millis() - silent_since) / 1000));
-            silent_since = 0;
+          if (id(radar_low_power).state) { reset_at = 0; return; }
+
+          Peek *radar = Peek::of(id(adt_radar));
+          uint32_t now = millis(), last = radar->last_frame_ms();
+          if (last == 0) return;                       // nothing received yet (boot)
+
+          // A reset on the previous pass, and frames are flowing again: it was stuck
+          if (reset_at != 0 && last - reset_at < 0x80000000UL) {
+            id(radar_resyncs).publish_state(id(radar_resyncs).state + 1);
+            ESP_LOGW("radar", "Radar parser was stuck – resynced, data flowing again");
+            reset_at = 0;
+          }
+          if (now - last > 5000) {
+            radar->resync();
+            reset_at = now;
           }
 
   # -------------------------------------------------------------------------
@@ -1383,15 +1358,6 @@ interval:
           }
 
           // ---- Presence: immediate (binary sensors only send on change) ----
-          // Entry trace: where the radar first saw someone. A first position
-          // deep inside the room means the radar was slow to pick them up;
-          // one at the doorway means any delay is downstream (Wi-Fi/HA).
-          static bool was_active = false;
-          if (active > 0 && !was_active) {
-            for (int t = 0; t < 3; t++)
-              if (det[t]) { ESP_LOGI("entry", "Presence ON – first seen at x=%d y=%d mm", (int) px[t], (int) py[t]); break; }
-          }
-          was_active = active > 0;
           id(occupancy).publish_state(active > 0);
           binary_sensor::BinarySensor *zbin[4] = { id(zone1_occupancy), id(zone2_occupancy), id(zone3_occupancy), id(zone4_occupancy) };
           for (int z = 0; z < 4; z++) zbin[z]->publish_state(zc[z] > 0);
@@ -1416,8 +1382,11 @@ interval:
 
   # -------------------------------------------------------------------------
   # IR receiver on PA18 → Home Assistant infrared receiver entity.
-  # Own interrupt handler that only timestamps edges and never reads the pin
-  # (LibreTiny's digitalRead() is what breaks remote_receiver here). On RTL8720C,
+  # Own interrupt handler that only timestamps edges and never reads the pin.
+  # ESPHome 2026.11 fixed reading pins from an interrupt on RTL8720C, but the
+  # native remote_receiver on PA18 still replayed stale frames, logged buffer
+  # overflow storms and produced corrupt timings (tested 20 Nov 2026), so this
+  # stays. On RTL8720C,
   # CHANGE really is both edges, and the receiver idles high, so the first edge
   # of a frame is a falling one (mark start) and the levels simply alternate.
   # -------------------------------------------------------------------------
@@ -1583,16 +1552,14 @@ interval:
   # (safe – these pins only go to the USB connector). Found: each 15 s pass
   # collects the previous measurement and starts the next, so nothing blocks.
   # -------------------------------------------------------------------------
-  - interval: 1s
+  - interval: 15s
     then:
       - lambda: |-
           static int sda = -1, scl = -1;      // set by detection
           static uint8_t ad = 0;
           static int type = 0;                // 0 = none, 3 = SHT3x, 4 = SHT4x, 5 = SHTC3
-          static uint32_t tick = 14;          // first attempt on the next pass
           static bool pending = false;
           static uint8_t fails = 0;
-          if (++tick % 15 != 0) return;
 
           auto lo  = [](int p) { pinMode(p, OUTPUT); digitalWrite(p, LOW); };
           auto rel = [](int p) { pinMode(p, INPUT_PULLUP); };   // internal pull-up helps on a 2 m cable
